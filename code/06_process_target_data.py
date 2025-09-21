@@ -4,7 +4,7 @@ import pandas as pd
 import scipy.io
 import pywt
 from scipy.stats import kurtosis, skew
-
+from scipy.signal import hilbert
 
 # ==============================================================================
 # 1. 工具函数 (从之前的脚本复用)
@@ -84,45 +84,53 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
             segment = signal[i: i + segment_len]
             num_segments += 1
 
-            # --- 3. 特征提取 (与03脚本的逻辑完全一致) ---
-            # 时域特征
+            # --- 3. 特征提取 (最终增强版) ---
+            # 时域特征 (保持不变)
             rms = np.sqrt(np.mean(segment ** 2))
             kurt = kurtosis(segment)
             sk = skew(segment)
             peak_to_peak = np.max(segment) - np.min(segment)
             crest_factor = np.max(np.abs(segment)) / rms if rms != 0 else 0
-
-            # 【新增】标准差
             std_dev = np.std(segment)
-
-            # 【新增】裕度因子 (Clearance Factor)
             clearance_factor = np.max(np.abs(segment)) / (np.mean(np.sqrt(np.abs(segment))) ** 2) if np.mean(
                 np.sqrt(np.abs(segment))) != 0 else 0
 
-            # 频域特征
-            fft_vals = np.abs(np.fft.fft(segment))[:n // 2]
+            # 频域特征 (分为两部分)
             theo_freqs = calculate_theoretical_frequencies(target_rpm)
-            freq_features = {}
+
+            # === 2.1 基于原始信号的频域特征 (保留) ===
+            fft_vals_raw = np.abs(np.fft.fft(segment))[:n // 2]
+            freq_features_raw = {}
             for f_type, f_val in theo_freqs.items():
                 for j in range(1, 4):
                     target_freq = f_val * j
                     idx = np.argmin(np.abs(freq_axis - target_freq))
-                    freq_features[f'{f_type}_{j}x'] = fft_vals[idx]
+                    freq_features_raw[f'{f_type}_{j}x_raw'] = fft_vals_raw[idx]
 
-            # 时频域特征
+            # === 2.2 【新增】基于包络谱的频域特征 ===
+            envelope = np.abs(hilbert(segment))
+            fft_vals_env = np.abs(np.fft.fft(envelope))[:n // 2]
+            freq_features_env = {}
+            for f_type, f_val in theo_freqs.items():
+                for j in range(1, 4):
+                    target_freq = f_val * j
+                    idx = np.argmin(np.abs(freq_axis - target_freq))
+                    freq_features_env[f'{f_type}_{j}x_env'] = fft_vals_env[idx]
+
+            # 时频域特征 (保持不变)
             wp = pywt.WaveletPacket(data=segment, wavelet='db1', mode='symmetric', maxlevel=3)
             nodes = wp.get_level(3, order='natural')
             wavelet_energy = [np.sum(node.data ** 2) for node in nodes]
 
             # 整合所有特征
             features = {
-                'source_file': filename,  # 记录样本来源文件
+                'source_file': filename,
                 'rpm': target_rpm,
                 'rms': rms, 'kurtosis': kurt, 'skewness': sk,
                 'peak_to_peak': peak_to_peak, 'crest_factor': crest_factor,
-                'std_dev': std_dev,  # 新增
-                'clearance_factor': clearance_factor,  # 新增
-                **freq_features,
+                'std_dev': std_dev, 'clearance_factor': clearance_factor,
+                **freq_features_raw,
+                **freq_features_env,
             }
             for j, energy in enumerate(wavelet_energy):
                 features[f'wavelet_energy_{j}'] = energy

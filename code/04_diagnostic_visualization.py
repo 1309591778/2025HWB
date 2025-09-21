@@ -32,7 +32,7 @@ def calculate_theoretical_frequencies(rpm):
 
 
 # ==============================================================================
-# 2. 核心可视化函数 (已包含全部三种图表)
+# 2. 核心可视化函数 (核心修改在图表三部分)
 # ==============================================================================
 def create_all_diagnostic_plots(segments, labels, rpms, sample_rate=32000):
     """【最终版】分别生成时域、频域、时频域三种分析图表。"""
@@ -101,36 +101,52 @@ def create_all_diagnostic_plots(segments, labels, rpms, sample_rate=32000):
     print(f"✅ 图表二已保存至:\n{os.path.abspath(save_path2)}")
     plt.close(fig2)
 
-    # --- 【新增】生成图表三：时频域分析图 (小波时频图) ---
-    print("🚀 开始生成时频域分析图...")
-    ir_idx = class_representatives['IR']
-    ir_segment = segments[ir_idx]
-    ir_rpm = rpms[ir_idx]
-    time_axis = np.arange(len(ir_segment)) / sample_rate
+    # --- 【核心修改】生成图表三：时频域分析图 (2x2 小波时频图) ---
+    print("🚀 开始生成时频域分析对比图...")
+    fig3, axes3 = plt.subplots(2, 2, figsize=(18, 12), sharex=True, sharey=True)
+    fig3.suptitle('四种轴承状态小波时频图对比', fontsize=22, weight='bold')
 
-    # 执行连续小波变换
-    wavelet = 'cmor1.5-1.0'  # 复Morlet小波
-    scales = np.arange(1, 512)  # 定义尺度范围
-    coefficients, frequencies = pywt.cwt(ir_segment, scales, wavelet, 1.0 / sample_rate)
+    wavelet = 'cmor1.5-1.0'
+    scales = np.arange(1, 512)
 
-    # 绘制时频图
-    fig3, ax3 = plt.subplots(figsize=(12, 8))
-    im = ax3.pcolormesh(time_axis, frequencies, np.abs(coefficients), cmap='viridis', shading='auto')
-    ax3.set_title('内圈故障(IR)信号的小波时频图', fontsize=18, weight='bold')
-    ax3.set_xlabel('时间 (s)', fontsize=14)
-    ax3.set_ylabel('频率 (Hz)', fontsize=14)
-    ax3.set_ylim([0, 600])  # 限制频率范围
-    fig3.colorbar(im, ax=ax3, label='幅值')
+    im = None
+    for ax, class_code in zip(axes3.flatten(), ['N', 'B', 'IR', 'OR']):
+        idx = class_representatives[class_code]
+        segment, rpm = segments[idx], rpms[idx]
+        time_axis = np.arange(len(segment)) / sample_rate
 
-    # 在时频图上标记理论故障频率
-    theo_freqs_ir = calculate_theoretical_frequencies(ir_rpm)
-    bpfi_val = theo_freqs_ir['BPFI']
-    ax3.axhline(y=bpfi_val, color='red', linestyle='--', alpha=0.9, label=f'BPFI={bpfi_val:.1f}Hz')
-    ax3.axhline(y=bpfi_val * 2, color='red', linestyle=':', alpha=0.9, label=f'2xBPFI={bpfi_val * 2:.1f}Hz')
-    ax3.legend()
+        coefficients, frequencies = pywt.cwt(segment, scales, wavelet, 1.0 / sample_rate)
 
-    plt.tight_layout()
-    save_path3 = os.path.join(output_dir, '时频域分析图(内圈故障小波).png')
+        im = ax.pcolormesh(time_axis, frequencies, np.abs(coefficients), cmap='viridis', shading='auto')
+        ax.set_title(f'{class_titles[class_code]} ({class_code})', fontsize=16)
+        ax.set_ylabel('频率 (Hz)', fontsize=12)
+        ax.set_xlabel('时间 (s)', fontsize=12)
+        ax.set_ylim([0, 600])
+
+        if class_code != 'N':
+            theo_freqs = calculate_theoretical_frequencies(rpm)
+            fault_freq_key = {'B': 'BSF', 'IR': 'BPFI', 'OR': 'BPFO'}[class_code]
+            fault_freq_val = theo_freqs[fault_freq_key]
+
+            # 【修改】统一使用高对比度的红色，并加粗线条
+            line_color = 'red'
+            line_width = 2
+
+            # 标记1倍频
+            ax.axhline(y=fault_freq_val, color=line_color, linestyle='--', linewidth=line_width,
+                       label=f'{fault_freq_key}={fault_freq_val:.1f}Hz')
+            # 标记2倍频
+            if fault_freq_val * 2 < 600:
+                ax.axhline(y=fault_freq_val * 2, color=line_color, linestyle=':', linewidth=line_width,
+                           label=f'2x{fault_freq_key}={fault_freq_val * 2:.1f}Hz')
+            ax.legend(loc='upper right')
+
+    # 【修改】使用更稳健的方法，手动为颜色条创建位置
+    fig3.subplots_adjust(right=0.88)  # 在图的右侧留出空间
+    cbar_ax = fig3.add_axes([0.9, 0.15, 0.03, 0.7])  # [left, bottom, width, height]
+    fig3.colorbar(im, cax=cbar_ax, label='幅值')
+
+    save_path3 = os.path.join(output_dir, '时频域分析对比图(四种状态).png')
     plt.savefig(save_path3, dpi=300)
     print(f"✅ 图表三已保存至:\n{os.path.abspath(save_path3)}")
     plt.close(fig3)
