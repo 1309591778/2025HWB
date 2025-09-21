@@ -92,6 +92,13 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
             peak_to_peak = np.max(segment) - np.min(segment)
             crest_factor = np.max(np.abs(segment)) / rms if rms != 0 else 0
 
+            # 【新增】标准差
+            std_dev = np.std(segment)
+
+            # 【新增】裕度因子 (Clearance Factor)
+            clearance_factor = np.max(np.abs(segment)) / (np.mean(np.sqrt(np.abs(segment))) ** 2) if np.mean(
+                np.sqrt(np.abs(segment))) != 0 else 0
+
             # 频域特征
             fft_vals = np.abs(np.fft.fft(segment))[:n // 2]
             theo_freqs = calculate_theoretical_frequencies(target_rpm)
@@ -113,6 +120,8 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
                 'rpm': target_rpm,
                 'rms': rms, 'kurtosis': kurt, 'skewness': sk,
                 'peak_to_peak': peak_to_peak, 'crest_factor': crest_factor,
+                'std_dev': std_dev,  # 新增
+                'clearance_factor': clearance_factor,  # 新增
                 **freq_features,
             }
             for j, energy in enumerate(wavelet_energy):

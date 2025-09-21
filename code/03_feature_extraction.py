@@ -31,11 +31,12 @@ def calculate_theoretical_frequencies(rpm):
 def extract_features(segments, labels, rpms, sample_rate=32000):
     """
     为每个信号段提取多维度特征。
+    【新版：增加了标准差和裕度因子】
     """
     feature_list = []
-    print("🚀 开始为所有样本段提取特征...")
+    print("🚀 开始为所有样本段提取特征 (增强版)...")
 
-    # 为FFT计算准备频率轴
+    # (FFT频率轴准备部分保持不变)
     n = segments.shape[1]
     freq_axis = np.fft.fftfreq(n, 1 / sample_rate)[:n // 2]
 
@@ -43,34 +44,34 @@ def extract_features(segments, labels, rpms, sample_rate=32000):
         label = labels[i]
         rpm = rpms[i]
 
-        # --- 1. 时域特征 ---
+        # --- 1. 时域特征 (增加2个) ---
         rms = np.sqrt(np.mean(seg ** 2))
         kurt = kurtosis(seg)
         sk = skew(seg)
         peak_to_peak = np.max(seg) - np.min(seg)
         crest_factor = np.max(np.abs(seg)) / rms if rms != 0 else 0
 
-        # --- 2. 频域特征 ---
+        # 【新增】标准差
+        std_dev = np.std(seg)
+
+        # 【新增】裕度因子 (Clearance Factor)
+        clearance_factor = np.max(np.abs(seg)) / (np.mean(np.sqrt(np.abs(seg))) ** 2) if np.mean(
+            np.sqrt(np.abs(seg))) != 0 else 0
+
+        # (频域特征部分保持不变)
         fft_vals = np.abs(np.fft.fft(seg))[:n // 2]
-
-        # 计算理论频率
         theo_freqs = calculate_theoretical_frequencies(rpm)
-
-        # 提取理论频率及其谐波(2x, 3x)的幅值
         freq_features = {}
         for f_type, f_val in theo_freqs.items():
             if f_val == 0:
-                for j in range(1, 4):
-                    freq_features[f'{f_type}_{j}x'] = 0
+                for j in range(1, 4): freq_features[f'{f_type}_{j}x'] = 0
                 continue
-
-            for j in range(1, 4):  # 1, 2, 3倍频
+            for j in range(1, 4):
                 target_freq = f_val * j
-                # 找到最接近理论频率的FFT频点的幅值
                 idx = np.argmin(np.abs(freq_axis - target_freq))
                 freq_features[f'{f_type}_{j}x'] = fft_vals[idx]
 
-        # --- 3. 时频域特征 (小波包变换能量) ---
+        # (时频域特征部分保持不变)
         wp = pywt.WaveletPacket(data=seg, wavelet='db1', mode='symmetric', maxlevel=3)
         nodes = wp.get_level(3, order='natural')
         wavelet_energy = [np.sum(node.data ** 2) for node in nodes]
@@ -84,9 +85,10 @@ def extract_features(segments, labels, rpms, sample_rate=32000):
             'skewness': sk,
             'peak_to_peak': peak_to_peak,
             'crest_factor': crest_factor,
-            **freq_features,  # 合并频域特征字典
+            'std_dev': std_dev,  # 新增
+            'clearance_factor': clearance_factor,  # 新增
+            **freq_features,
         }
-        # 合并小波能量特征
         for j, energy in enumerate(wavelet_energy):
             features[f'wavelet_energy_{j}'] = energy
 

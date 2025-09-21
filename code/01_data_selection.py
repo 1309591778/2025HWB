@@ -87,7 +87,7 @@ def select_files_guaranteed_count(df: pd.DataFrame):
 
     final_selected_dfs = [df_n]
     for f_type, targets in selection_targets.items():
-        target_count = 5
+        target_count = 12
         df_pool = df_fault_pool[df_fault_pool['fault_type'] == f_type]
 
         primary_selection_list = []
