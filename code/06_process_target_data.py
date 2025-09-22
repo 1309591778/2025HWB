@@ -177,6 +177,45 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
                     'envelope_impulse_factor': safe_divide(np.max(envelope), envelope_mean)
                 }
 
+            # ======================================================================
+            # 新增：N类样本增强特征 (与03脚本保持一致)
+            # ======================================================================
+            n_class_specific_features = {}
+            try:
+                # 平稳性特征：自相关衰减率
+                autocorr = np.correlate(segment, segment, mode='full')
+                autocorr = autocorr[len(autocorr) // 2:]
+                # 计算自相关衰减率（前100个点）
+                decay_window = min(100, len(autocorr))
+                if decay_window > 1:
+                    decay_rate = np.sum(np.abs(np.diff(autocorr[:decay_window]))) / decay_window
+                else:
+                    decay_rate = 0
+
+                # 噪声水平特征
+                diff_seg = np.diff(segment)
+                if len(diff_seg) > 0:
+                    noise_level = safe_divide(np.std(diff_seg), np.std(segment))
+                else:
+                    noise_level = 0
+
+                # 冲击指标（正常信号应该很少有冲击）
+                envelope = np.abs(hilbert(segment))
+                impulse_indicator = safe_divide(np.max(envelope), np.mean(envelope))
+
+                n_class_specific_features = {
+                    'N_autocorr_decay': float(decay_rate) if not np.isnan(decay_rate) else 0,
+                    'N_noise_level': float(noise_level) if not np.isnan(noise_level) else 0,
+                    'N_impulse_indicator': float(impulse_indicator) if not np.isnan(impulse_indicator) else 0
+                }
+            except:
+                # 如果计算失败，使用默认值
+                n_class_specific_features = {
+                    'N_autocorr_decay': 0,
+                    'N_noise_level': 0,
+                    'N_impulse_indicator': 0
+                }
+
             # 整合所有特征
             features = {
                 'source_file': filename, 'rpm': target_rpm,
@@ -193,6 +232,8 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
                 'shape_factor': shape_factor,
                 **spectral_features,
                 **envelope_features,
+                # N类专属特征（新增）
+                **n_class_specific_features,
             }
             for j, energy in enumerate(wavelet_energy):
                 features[f'wavelet_energy_{j}'] = energy

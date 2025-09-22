@@ -29,35 +29,84 @@ def set_chinese_font():
     print("✅ 已设置中文字体。")
 
 
-def create_cnn_attention_model(input_shape, num_classes):
-    """创建1D-CNN + Attention模型"""
+def categorical_focal_loss(gamma=2., alpha=0.25):
+    """
+    Focal Loss for addressing class imbalance in categorical classification
+    """
+
+    def categorical_focal_loss_fixed(y_true, y_pred):
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.keras.backend.clip(y_pred, epsilon, 1. - epsilon)
+        cross_entropy = -y_true * tf.keras.backend.log(y_pred)
+        weight = alpha * y_true * tf.keras.backend.pow((1 - y_pred), gamma)
+        loss = weight * cross_entropy
+        loss = tf.keras.backend.sum(loss, axis=1)
+        return loss
+
+    return categorical_focal_loss_fixed
+
+
+def create_improved_cnn_model(input_shape, num_classes):
+    """创建改进的1D-CNN模型"""
+    """修复注意力机制的CNN模型"""
     inputs = Input(shape=input_shape)
+
+    # 特征提取
     x = Conv1D(filters=64, kernel_size=3, padding='same')(inputs)
     x = BatchNormalization()(x)
     x = ReLU()(x)
     x = MaxPooling1D(pool_size=2, padding='same')(x)
+
     x = Conv1D(filters=128, kernel_size=3, padding='same')(x)
     x = BatchNormalization()(x)
-    cnn_out = ReLU()(x)  # Shape: (batch_size, steps, 128)
+    x = ReLU()(x)
+    x = MaxPooling1D(pool_size=2, padding='same')(x)
 
-    # --- 【核心修正】在时间步维度上计算注意力 ---
-    # Step 1: 生成每个时间步的"能量"分数
-    attention = Dense(1, activation='tanh')(cnn_out)  # Shape: (batch_size, steps, 1)
-    # Step 2: 在时间步（axis=1）上进行Softmax，得到归一化的注意力权重
-    attention_probs = Activation('softmax', name='attention_weights')(attention)  # Shape: (batch_size, steps, 1)
-    # Step 3: 将权重应用到原始特征上
-    attention_mul = multiply([cnn_out, attention_probs])  # Shape: (batch_size, steps, 128)
+    x = Conv1D(filters=256, kernel_size=3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    cnn_out = MaxPooling1D(pool_size=2, padding='same')(x)  # Shape: (batch, steps, 256)
 
+    # 修复的注意力机制 - 在特征维度上计算注意力
+    # Step 1: 将特征维度变换用于注意力计算
+    attention_weights = Dense(256, activation='tanh')(cnn_out)  # Shape: (batch, steps, 256)
+    attention_scores = Dense(1, activation='tanh')(attention_weights)  # Shape: (batch, steps, 1)
+    # 修复：正确使用softmax的axis参数
+    attention_probs = Activation(lambda x: tf.nn.softmax(x, axis=1), name='attention_weights')(
+        attention_scores)  # 在时间步维度softmax
+
+    # Step 2: 应用注意力权重
+    attention_mul = multiply([cnn_out, attention_probs])  # Shape: (batch, steps, 256)
+
+    # Step 3: 聚合
     x = GlobalAveragePooling1D()(attention_mul)
     x = Dense(128, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    outputs = Dense(num_classes, activation='softmax', name='main_output')(x)
+    x = Dropout(0.3)(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
 
-    model = Model(inputs=inputs, outputs=outputs, name='cnn_attention_model')  # 只返回主输出
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=categorical_focal_loss(gamma=2., alpha=0.5),  # 使用Focal Loss
+        metrics=['accuracy']
+    )
     return model
+
+
+def compute_balanced_sample_weights(y, n_class_index=2, n_class_weight=3.0):
+    """计算平衡的样本权重，给N类更高的权重"""
+    # 获取类别数量
+    n_classes = len(np.unique(y))
+
+    # 默认权重为1.0
+    class_weights = {i: 1.0 for i in range(n_classes)}
+
+    # 给N类（假设索引为2）更高的权重
+    class_weights[n_class_index] = n_class_weight
+
+    # 为每个样本分配权重
+    sample_weights = np.array([class_weights[label] for label in y])
+    return sample_weights
 
 
 # ==============================================================================
@@ -103,16 +152,27 @@ if __name__ == "__main__":
             X_train, y_train, test_size=0.2, stratify=y_train, random_state=RANDOM_STATE
         )
 
-        # 转换为 DMatrix 格式
-        dtrain = xgb.DMatrix(X_train_sub, label=y_train_sub)
-        dval = xgb.DMatrix(X_val, label=y_val)
+        # 计算样本权重，重点提升N类权重
+        sample_weights_train = compute_balanced_sample_weights(y_train_sub)
+        sample_weights_val = compute_balanced_sample_weights(y_val)
 
-        # 设置参数
+        # 转换为 DMatrix 格式，加入样本权重
+        dtrain = xgb.DMatrix(X_train_sub, label=y_train_sub, weight=sample_weights_train)
+        dval = xgb.DMatrix(X_val, label=y_val, weight=sample_weights_val)
+
+        # 优化参数：针对类别不平衡问题
         params = {
             'objective': 'multi:softprob',
             'eval_metric': 'mlogloss',
-            'num_class': NUM_CLASSES,  # 类别数
-            'random_state': RANDOM_STATE
+            'num_class': NUM_CLASSES,
+            'random_state': RANDOM_STATE,
+            # 优化参数
+            'max_depth': 6,  # 降低深度避免过拟合
+            'learning_rate': 0.1,  # 提高学习率
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'min_child_weight': 3,  # 增加最小权重
+            'gamma': 0.2,  # 增加最小损失减少量
         }
 
         # 使用原生训练 API + 早停
@@ -120,9 +180,9 @@ if __name__ == "__main__":
         bst = xgb.train(
             params,
             dtrain,
-            num_boost_round=1000,
+            num_boost_round=500,  # 减少迭代次数
             evals=[(dtrain, 'train'), (dval, 'val')],
-            early_stopping_rounds=15,
+            early_stopping_rounds=30,  # 早停轮数
             evals_result=evals_result,
             verbose_eval=False
         )
@@ -138,20 +198,25 @@ if __name__ == "__main__":
         print("  - 正在训练 1D-CNN + Attention (含早停)...")
         X_train_cnn, X_test_cnn = np.expand_dims(X_train, axis=2), np.expand_dims(X_test, axis=2)
         y_train_cat = to_categorical(y_train, num_classes=NUM_CLASSES)
-        cnn_model = create_cnn_attention_model(input_shape=(X_train_cnn.shape[1], 1), num_classes=NUM_CLASSES)
-        early_stopping = EarlyStopping(monitor='val_accuracy', patience=10, restore_best_weights=True)
+        # 使用改进的CNN模型
+        cnn_model = create_improved_cnn_model(input_shape=(X_train_cnn.shape[1], 1), num_classes=NUM_CLASSES)
+        # 调整早停参数
+        early_stopping = EarlyStopping(monitor='val_accuracy', patience=30, restore_best_weights=True)
 
-        # 修正：计算类别权重并正确使用
+        # 计算类别权重
         class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
         class_weight_dict = dict(enumerate(class_weights))
 
-        # 修正：CNN模型训练时正确使用标签格式和类别权重
-        cnn_model.fit(X_train_cnn, y_train_cat,  # 修正：使用正确的标签格式
-                      epochs=100, batch_size=64, verbose=0,
-                      validation_split=0.2,
-                      # 修正：添加类别权重
-                      class_weight=class_weight_dict,
-                      callbacks=[early_stopping])
+        # 使用Focal Loss和类别权重训练
+        cnn_model.fit(
+            X_train_cnn, y_train_cat,
+            epochs=200,  # 增加训练轮数
+            batch_size=32,  # 减小批次大小
+            verbose=0,
+            validation_split=0.2,
+            class_weight=class_weight_dict,
+            callbacks=[early_stopping]
+        )
         y_pred_cnn_prob = cnn_model.predict(X_test_cnn)
         y_pred_cnn = np.argmax(y_pred_cnn_prob, axis=1)
         cnn_all_y_pred.extend(y_pred_cnn)
@@ -191,23 +256,37 @@ if __name__ == "__main__":
     final_scaler = StandardScaler().fit(X_raw)
     X_scaled_full = final_scaler.transform(X_raw)
 
+    # 计算样本权重，重点提升N类权重
+    sample_weights_full = compute_balanced_sample_weights(y)
+
     print("  - 正在训练最终的XGBoost模型...")
-    final_xgb_model = xgb.XGBClassifier(objective='multi:softprob', eval_metric='mlogloss', random_state=RANDOM_STATE,
-                                        n_estimators=200, scale_pos_weight=1)  # 使用一个合理的树数量
-    final_xgb_model.fit(X_scaled_full, y)
+    final_xgb_model = xgb.XGBClassifier(
+        objective='multi:softprob',
+        eval_metric='mlogloss',
+        random_state=RANDOM_STATE,
+        n_estimators=500,  # 增加树数量
+        max_depth=6,  # 降低深度避免过拟合
+        learning_rate=0.1,  # 合适的学习率
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        gamma=0.2,
+    )
+    final_xgb_model.fit(X_scaled_full, y, sample_weight=sample_weights_full)
 
     print("  - 正在训练最终的1D-CNN+Attention模型...")
     X_cnn_full = np.expand_dims(X_scaled_full, axis=2)
     y_cat_full = to_categorical(y, num_classes=NUM_CLASSES)
-    final_cnn_model = create_cnn_attention_model(input_shape=(X_cnn_full.shape[1], 1), num_classes=NUM_CLASSES)
+    # 使用改进的CNN模型
+    final_cnn_model = create_improved_cnn_model(input_shape=(X_cnn_full.shape[1], 1), num_classes=NUM_CLASSES)
     # --- 【核心修正】为最终模型训练添加早停，防止过拟合 ---
-    early_stopping_final = EarlyStopping(monitor='accuracy', patience=10, restore_best_weights=True)
+    early_stopping_final = EarlyStopping(monitor='accuracy', patience=30, restore_best_weights=True)
 
     # 为最终模型也添加类别权重
     class_weights_final = compute_class_weight('balanced', classes=np.unique(y), y=y)
     class_weight_dict_final = dict(enumerate(class_weights_final))
 
-    final_cnn_model.fit(X_cnn_full, y_cat_full, epochs=100, batch_size=64, verbose=0,
+    final_cnn_model.fit(X_cnn_full, y_cat_full, epochs=200, batch_size=32, verbose=0,
                         class_weight=class_weight_dict_final,  # 添加类别权重
                         callbacks=[early_stopping_final])
 

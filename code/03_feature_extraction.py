@@ -104,6 +104,46 @@ def extract_features(segments, labels, rpms, filenames, sample_rate=32000):
             wavelet_entropy = 0
 
         # ======================================================================
+        # 新增：N类样本增强特征
+        # ======================================================================
+        n_class_specific_features = {}
+        if label == 'N':
+            try:
+                # 平稳性特征：自相关衰减率
+                autocorr = np.correlate(seg, seg, mode='full')
+                autocorr = autocorr[len(autocorr) // 2:]
+                # 计算自相关衰减率（前100个点）
+                decay_window = min(100, len(autocorr))
+                if decay_window > 1:
+                    decay_rate = np.sum(np.abs(np.diff(autocorr[:decay_window]))) / decay_window
+                else:
+                    decay_rate = 0
+
+                # 噪声水平特征
+                diff_seg = np.diff(seg)
+                if len(diff_seg) > 0:
+                    noise_level = safe_divide(np.std(diff_seg), np.std(seg))
+                else:
+                    noise_level = 0
+
+                # 冲击指标（正常信号应该很少有冲击）
+                envelope = np.abs(hilbert(seg))
+                impulse_indicator = safe_divide(np.max(envelope), np.mean(envelope))
+
+                n_class_specific_features = {
+                    'N_autocorr_decay': float(decay_rate) if not np.isnan(decay_rate) else 0,
+                    'N_noise_level': float(noise_level) if not np.isnan(noise_level) else 0,
+                    'N_impulse_indicator': float(impulse_indicator) if not np.isnan(impulse_indicator) else 0
+                }
+            except:
+                # 如果计算失败，使用默认值
+                n_class_specific_features = {
+                    'N_autocorr_decay': 0,
+                    'N_noise_level': 0,
+                    'N_impulse_indicator': 0
+                }
+
+        # ======================================================================
         # 回归：只保留经过验证的稳定特征
         # ======================================================================
 
@@ -123,6 +163,8 @@ def extract_features(segments, labels, rpms, filenames, sample_rate=32000):
             'wavelet_entropy': float(wavelet_entropy) if np.isfinite(wavelet_entropy) else 0,
             **{k: float(v) if np.isfinite(v) else 0 for k, v in freq_features_env.items()},
             **{k: float(v) if np.isfinite(v) else 0 for k, v in harmonic_ratios.items()},
+            # N类专属特征（新增）
+            **{k: float(v) if np.isfinite(v) else 0 for k, v in n_class_specific_features.items()},
         }
 
         # 小波能量特征
