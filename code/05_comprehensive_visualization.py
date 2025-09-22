@@ -101,10 +101,24 @@ def create_final_visualizations(segments, labels, rpms, df_features, sample_rate
     print("  - 正在计算 t-SNE 降维...")
     X = df_features.drop(columns=['label', 'rpm', 'filename'])
     y_str = df_features['label']
+
+    # === 新增：处理NaN值 ===
+    print(f"    - 特征维度: {X.shape}")
+    nan_count = X.isnull().sum().sum()
+    print(f"    - NaN值统计: {nan_count} 个")
+
+    # 用0填充NaN值
+    X = X.fillna(0)
+    print(f"    - NaN值处理完成")
+    # === 新增结束 ===
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    tsne = TSNE(n_components=2, perplexity=40, random_state=42, n_iter=1000)
+
+    # === 修改：使用max_iter替代n_iter ===
+    tsne = TSNE(n_components=2, perplexity=40, random_state=42, max_iter=1000)
     tsne_results = tsne.fit_transform(X_scaled)
+    # === 修改结束 ===
 
     plt.figure(figsize=(12, 10))
     sns.scatterplot(x=tsne_results[:, 0], y=tsne_results[:, 1], hue=y_str, style=y_str, s=50, alpha=0.7)
