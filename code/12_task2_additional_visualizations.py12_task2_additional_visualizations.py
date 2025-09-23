@@ -8,10 +8,67 @@ import joblib
 import xgboost as xgb
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.ensemble import RandomForestClassifier
 import shap
-from scipy.signal import hilbert
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, ReLU, MaxPooling1D, LSTM, \
+    GlobalAveragePooling1D, Dense, Dropout, multiply, Activation
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping
+
+# ==================== 添加模型定义函数 ====================
+def categorical_focal_loss(gamma=2., alpha=0.25):
+    """
+    Focal Loss for addressing class imbalance in categorical classification
+    """
+    def categorical_focal_loss_fixed(y_true, y_pred):
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.keras.backend.clip(y_pred, epsilon, 1. - epsilon)
+        cross_entropy = -y_true * tf.keras.backend.log(y_pred)
+        weight = alpha * y_true * tf.keras.backend.pow((1 - y_pred), gamma)
+        loss = weight * cross_entropy
+        loss = tf.keras.backend.sum(loss, axis=1)
+        return loss
+
+    return categorical_focal_loss_fixed
+
+
+def create_cnn_lstm_model(input_shape, num_classes):
+    """创建简单的CNN+LSTM模型"""
+    inputs = Input(shape=input_shape)
+
+    # CNN特征提取层
+    x = Conv1D(filters=64, kernel_size=3, padding='same')(inputs)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = MaxPooling1D(pool_size=2, padding='same')(x)
+
+    x = Conv1D(filters=128, kernel_size=3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = MaxPooling1D(pool_size=2, padding='same')(x)
+
+    # LSTM时序建模层
+    x = LSTM(64, return_sequences=True)(x)
+    x = LSTM(32, return_sequences=False)(x)
+
+    # 全连接分类层
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
+
+    # 注意：在加载权重时，通常不需要编译模型。
+    # 但如果后续需要（例如微调），可以取消下面的注释并确保 categorical_focal_loss 可用。
+    # model.compile(
+    #     optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    #     loss=categorical_focal_loss(gamma=2., alpha=0.5),
+    #     metrics=['accuracy']
+    # )
+    return model
+# ==================== 添加模型定义函数结束 ====================
 
 
 # 设置中文字体
@@ -30,405 +87,443 @@ def create_output_dir():
     return output_dir
 
 
-# 1. SHAP特征重要性图（Top 10特征）- XGBoost
+# 1. SHAP特征重要性图（Top 10特征）- XGBoost (修复版)
 def plot_shap_feature_importance(X, model, feature_names, output_dir):
     """绘制SHAP特征重要性图"""
     print("  - 正在生成SHAP特征重要性图...")
 
-    # 创建SHAP解释器
-    explainer = shap.TreeExplainer(model)
-
-    # 为了提高效率，只使用部分数据计算SHAP值
-    sample_size = min(1000, X.shape[0])
-    sample_indices = np.random.choice(X.shape[0], sample_size, replace=False)
-    X_sample = pd.DataFrame(X[sample_indices], columns=feature_names)
-
-    # 计算SHAP值
-    shap_values = explainer.shap_values(X_sample)
-
-    # 如果是多分类，shap_values是一个列表
-    if isinstance(shap_values, list):
-        # 对于多分类，我们计算每个类别的平均绝对SHAP值
-        shap_importance = np.mean([np.abs(sv).mean(0) for sv in shap_values], axis=0)
-    else:
-        shap_importance = np.abs(shap_values).mean(0)
-
-    # 创建特征重要性DataFrame
-    feature_importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': shap_importance
-    }).sort_values('importance', ascending=False)
-
-    # 绘制Top 10特征重要性
-    plt.figure(figsize=(12, 8))
-    top_features = feature_importance_df.head(10)
-    sns.barplot(data=top_features, x='importance', y='feature', palette='viridis')
-    plt.title('Top 10 SHAP特征重要性 (XGBoost)', fontsize=16, weight='bold')
-    plt.xlabel('平均SHAP值', fontsize=12)
-    plt.ylabel('特征名称', fontsize=12)
-    plt.tight_layout()
-
-    save_path = os.path.join(output_dir, '12_1_shap_feature_importance_xgboost.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  - ✅ SHAP特征重要性图已保存至: {save_path}")
-
-
-# 2. CNN模型注意力权重分析
-def plot_cnn_attention_weights(model, X_sample, output_dir):
-    """绘制CNN模型注意力权重分析图"""
-    print("  - 正在生成CNN注意力权重分析图...")
-
     try:
-        # 获取注意力权重层的输出
-        # 创建一个模型来获取中间层输出
-        attention_model = tf.keras.Model(
-            inputs=model.input,
-            outputs=model.get_layer('attention_weights').output
-        )
+        # 确保X是numpy数组且形状正确
+        if isinstance(X, pd.DataFrame):
+            X_array = X.values
+        else:
+            X_array = np.asarray(X)
 
-        # 预测并获取注意力权重
-        attention_weights = attention_model.predict(X_sample[:100])  # 取前100个样本
+        # 创建SHAP解释器
+        explainer = shap.TreeExplainer(model)
 
-        # 计算平均注意力权重
-        avg_attention = np.mean(attention_weights, axis=0).flatten()
+        # 为了提高效率，只使用部分数据计算SHAP值
+        sample_size = min(500, X_array.shape[0])  # 减少样本数避免内存问题
+        sample_indices = np.random.choice(X_array.shape[0], sample_size, replace=False)
+        X_sample = X_array[sample_indices]
 
-        # 绘制注意力权重分布
-        plt.figure(figsize=(12, 6))
-        plt.plot(avg_attention, 'o-', linewidth=2, markersize=6)
-        plt.title('CNN注意力机制权重分布', fontsize=16, weight='bold')
-        plt.xlabel('时间步索引', fontsize=12)
-        plt.ylabel('注意力权重', fontsize=12)
-        plt.grid(True, alpha=0.3)
+        # 确保特征名称是列表
+        if isinstance(feature_names, pd.Index):
+            feature_names_list = feature_names.tolist()
+        else:
+            feature_names_list = list(feature_names)
+
+        # 确保X_sample是二维数组且列数与特征名称匹配
+        if X_sample.ndim == 1:
+            X_sample = X_sample.reshape(-1, 1)
+
+        # 如果特征数量不匹配，截取或补齐
+        if X_sample.shape[1] != len(feature_names_list):
+            min_features = min(X_sample.shape[1], len(feature_names_list))
+            X_sample = X_sample[:, :min_features]
+            feature_names_list = feature_names_list[:min_features]
+            print(f"  - ⚠️ 特征数量不匹配，已调整为 {min_features} 个特征")
+
+        # 创建DataFrame确保列名正确
+        X_sample_df = pd.DataFrame(X_sample, columns=feature_names_list)
+
+        # 计算SHAP值
+        shap_values = explainer.shap_values(X_sample_df)
+
+        # 如果是多分类，shap_values是一个列表
+        if isinstance(shap_values, list):
+            # 对于多分类，我们计算每个类别的平均绝对SHAP值
+            shap_importance = np.mean([np.abs(sv).mean(0) for sv in shap_values], axis=0)
+        else:
+            shap_importance = np.abs(shap_values).mean(0)
+
+        # 确保shap_importance是一维数组且长度与特征名称匹配
+        if hasattr(shap_importance, 'ndim') and shap_importance.ndim > 1:
+            shap_importance = shap_importance.flatten()
+
+        if len(shap_importance) != len(feature_names_list):
+            min_len = min(len(shap_importance), len(feature_names_list))
+            shap_importance = shap_importance[:min_len]
+            feature_names_list = feature_names_list[:min_len]
+
+        # 创建特征重要性DataFrame
+        feature_importance_df = pd.DataFrame({
+            'feature': feature_names_list,
+            'importance': np.abs(shap_importance)  # 确保是绝对值
+        }).sort_values('importance', ascending=False)
+
+        # 绘制Top 10特征重要性
+        plt.figure(figsize=(12, 8))
+        top_features = feature_importance_df.head(10)
+        sns.barplot(data=top_features, x='importance', y='feature', palette='viridis')
+        plt.title('Top 10 SHAP特征重要性 (XGBoost)', fontsize=16, weight='bold')
+        plt.xlabel('平均SHAP值', fontsize=12)
+        plt.ylabel('特征名称', fontsize=12)
         plt.tight_layout()
 
-        save_path = os.path.join(output_dir, '12_2_cnn_attention_weights.png')
+        save_path = os.path.join(output_dir, '12_1_shap_feature_importance_xgboost.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"  - ✅ CNN注意力权重分析图已保存至: {save_path}")
+        print(f"  - ✅ SHAP特征重要性图已保存至: {save_path}")
 
     except Exception as e:
-        print(f"  - ⚠️ 无法生成CNN注意力权重图: {e}")
+        print(f"  - ⚠️ 生成SHAP特征重要性图时出错: {e}")
+        import traceback
+        traceback.print_exc()
 
 
-# 3. 各类别决策关键特征雷达图
-def plot_decision_key_features_radar(df_features, output_dir):
-    """绘制各类别决策关键特征雷达图"""
-    print("  - 正在生成各类别决策关键特征雷达图...")
+# 2. 类别分布饼图 (作为问题背景说明)
+def plot_class_distribution(y_true, class_names, output_dir):
+    """绘制类别分布饼图"""
+    print("  - 正在生成类别分布饼图...")
 
-    # 选择一些关键特征进行分析
-    key_features = ['rms', 'kurtosis', 'crest_factor', 'wavelet_entropy', 'N_autocorr_decay']
+    try:
+        # 统计各类别数量
+        unique, counts = np.unique(y_true, return_counts=True)
+        class_counts = dict(zip(unique, counts))
+        class_labels = [class_names[i] for i in unique]
+        class_values = [class_counts[i] for i in unique]
 
-    # 计算各类别的特征均值
-    class_stats = df_features.groupby('label')[key_features].mean()
+        # 绘制饼图
+        plt.figure(figsize=(10, 8))
+        colors = ['gold', 'yellowgreen', 'lightcoral', 'lightskyblue', 'orange']
+        plt.pie(class_values, labels=class_labels, colors=colors, autopct='%1.1f%%', startangle=140)
+        plt.title('源域数据集类别分布\n(用于揭示数据不平衡挑战)', fontsize=16, weight='bold')
+        plt.axis('equal')
 
-    # 标准化特征值以便比较
-    from sklearn.preprocessing import MinMaxScaler
-    scaler = MinMaxScaler()
-    class_stats_scaled = pd.DataFrame(
-        scaler.fit_transform(class_stats),
-        columns=key_features,
-        index=class_stats.index
-    )
-
-    # 绘制雷达图
-    labels = np.array(key_features)
-    num_vars = len(labels)
-
-    angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
-    angles += angles[:1]  # 闭合图形
-
-    fig, ax = plt.subplots(figsize=(12, 10), subplot_kw=dict(projection='polar'))
-
-    colors = ['red', 'blue', 'green', 'orange']
-    for i, (class_name, row) in enumerate(class_stats_scaled.iterrows()):
-        values = row.tolist()
-        values += values[:1]  # 闭合图形
-        ax.plot(angles, values, 'o-', linewidth=2, label=class_name, color=colors[i % len(colors)])
-        ax.fill(angles, values, alpha=0.25, color=colors[i % len(colors)])
-
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels, fontsize=12)
-    ax.set_ylim(0, 1)
-    ax.set_title('各类别关键特征雷达图', size=16, weight='bold', pad=20)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
-    plt.tight_layout()
-
-    save_path = os.path.join(output_dir, '12_3_decision_key_features_radar.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  - ✅ 各类别决策关键特征雷达图已保存至: {save_path}")
-
-
-# 4. 混淆样本时频特征对比图（N↔OR, OR↔B）
-def plot_confused_samples_comparison(df_segments, labels, rpms, output_dir):
-    """绘制混淆样本时频特征对比图"""
-    print("  - 正在生成混淆样本时频特征对比图...")
-
-    # 找到一些N和OR类别的样本进行对比
-    n_indices = np.where(labels == 'N')[0][:3]  # 取前3个N类样本
-    or_indices = np.where(labels == 'OR')[0][:3]  # 取前3个OR类样本
-    b_indices = np.where(labels == 'B')[0][:3]  # 取前3个B类样本
-
-    # 创建对比图
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
-    fig.suptitle('混淆样本时域波形对比图', fontsize=20, weight='bold')
-
-    sample_rate = 32000
-    time_axis = np.arange(4096) / sample_rate
-
-    # 绘制N类样本
-    for i, idx in enumerate(n_indices):
-        segment = df_segments[idx]
-        axes[0, i].plot(time_axis, segment, color='green', linewidth=1)
-        axes[0, i].set_title(f'N类样本 {i + 1}', fontsize=14)
-        axes[0, i].set_xlabel('时间 (s)')
-        axes[0, i].set_ylabel('加速度')
-        axes[0, i].grid(True, alpha=0.3)
-
-    # 绘制OR类样本
-    for i, idx in enumerate(or_indices):
-        segment = df_segments[idx]
-        axes[1, i].plot(time_axis, segment, color='red', linewidth=1)
-        axes[1, i].set_title(f'OR类样本 {i + 1}', fontsize=14)
-        axes[1, i].set_xlabel('时间 (s)')
-        axes[1, i].set_ylabel('加速度')
-        axes[1, i].grid(True, alpha=0.3)
-
-    # 绘制B类样本
-    for i, idx in enumerate(b_indices):
-        segment = df_segments[idx]
-        axes[2, i].plot(time_axis, segment, color='orange', linewidth=1)
-        axes[2, i].set_title(f'B类样本 {i + 1}', fontsize=14)
-        axes[2, i].set_xlabel('时间 (s)')
-        axes[2, i].set_ylabel('加速度')
-        axes[2, i].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, '12_4_confused_samples_time_domain.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  - ✅ 混淆样本时域波形对比图已保存至: {save_path}")
-
-    # 频域对比图
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
-    fig.suptitle('混淆样本频域特征对比图', fontsize=20, weight='bold')
-
-    freq_axis = np.fft.fftfreq(4096, 1 / sample_rate)[:2048]
-
-    # 绘制N类样本频域
-    for i, idx in enumerate(n_indices):
-        segment = df_segments[idx]
-        fft_vals = np.abs(np.fft.fft(segment))[:2048]
-        axes[0, i].plot(freq_axis, fft_vals, color='green', linewidth=1)
-        axes[0, i].set_title(f'N类样本 {i + 1} 频谱', fontsize=14)
-        axes[0, i].set_xlabel('频率 (Hz)')
-        axes[0, i].set_ylabel('幅值')
-        axes[0, i].grid(True, alpha=0.3)
-
-    # 绘制OR类样本频域
-    for i, idx in enumerate(or_indices):
-        segment = df_segments[idx]
-        fft_vals = np.abs(np.fft.fft(segment))[:2048]
-        axes[1, i].plot(freq_axis, fft_vals, color='red', linewidth=1)
-        axes[1, i].set_title(f'OR类样本 {i + 1} 频谱', fontsize=14)
-        axes[1, i].set_xlabel('频率 (Hz)')
-        axes[1, i].set_ylabel('幅值')
-        axes[1, i].grid(True, alpha=0.3)
-
-    # 绘制B类样本频域
-    for i, idx in enumerate(b_indices):
-        segment = df_segments[idx]
-        fft_vals = np.abs(np.fft.fft(segment))[:2048]
-        axes[2, i].plot(freq_axis, fft_vals, color='orange', linewidth=1)
-        axes[2, i].set_title(f'B类样本 {i + 1} 频谱', fontsize=14)
-        axes[2, i].set_xlabel('频率 (Hz)')
-        axes[2, i].set_ylabel('幅值')
-        axes[2, i].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, '12_5_confused_samples_frequency_domain.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  - ✅ 混淆样本频域特征对比图已保存至: {save_path}")
-
-
-# 5. 错误分类样本特征分布热力图
-def plot_misclassified_features_heatmap(df_features, y_true, y_pred, le, output_dir):
-    """绘制错误分类样本特征分布热力图"""
-    print("  - 正在生成错误分类样本特征分布热力图...")
-
-    # 找到错误分类的样本
-    error_indices = np.where(y_true != y_pred)[0]
-
-    if len(error_indices) > 0:
-        # 选择错误分类样本和正确分类样本进行对比
-        correct_indices = np.where(y_true == y_pred)[0][:len(error_indices)]  # 取相同数量的正确样本
-
-        # 创建对比DataFrame
-        error_samples = df_features.iloc[error_indices].copy()
-        error_samples['classification'] = '错误分类'
-
-        correct_samples = df_features.iloc[correct_indices].copy()
-        correct_samples['classification'] = '正确分类'
-
-        comparison_df = pd.concat([error_samples, correct_samples])
-
-        # 选择数值型特征
-        numeric_features = comparison_df.select_dtypes(include=[np.number]).columns.tolist()
-        numeric_features = [f for f in numeric_features if f not in ['rpm']]  # 排除rpm
-
-        # 计算各类别各特征的均值
-        feature_means = comparison_df.groupby('classification')[numeric_features].mean()
-
-        # 绘制热力图
-        plt.figure(figsize=(20, 6))
-        sns.heatmap(feature_means, annot=False, cmap='RdYlBu_r', center=0,
-                    cbar_kws={'label': '特征均值'})
-        plt.title('错误分类 vs 正确分类样本特征分布热力图', fontsize=16, weight='bold')
-        plt.xlabel('特征名称')
-        plt.ylabel('分类结果')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-
-        save_path = os.path.join(output_dir, '12_6_misclassified_features_heatmap.png')
+        save_path = os.path.join(output_dir, '12_4_class_distribution.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"  - ✅ 错误分类样本特征分布热力图已保存至: {save_path}")
-    else:
-        print("  - 未发现错误分类样本，跳过热力图生成")
+        print(f"  - ✅ 类别分布饼图已保存至: {save_path}")
+
+    except Exception as e:
+        print(f"  - ⚠️ 生成类别分布饼图时出错: {e}")
 
 
-# 6. 不同特征子集性能对比柱状图
-def plot_feature_subset_performance(df_features, output_dir):
-    """绘制不同特征子集性能对比柱状图"""
-    print("  - 正在生成不同特征子集性能对比柱状图...")
+# 3. 混淆矩阵热力图（综合）
+def plot_confusion_matrix_heatmap(y_true, y_pred_models, class_names, output_dir):
+    """绘制综合混淆矩阵热力图"""
+    print("  - 正在生成综合混淆矩阵热力图...")
 
-    # 定义不同的特征子集
-    feature_subsets = {
-        '时域特征': ['rms', 'kurtosis', 'skewness', 'crest_factor', 'std_dev'],
-        '频域特征': ['BPFI_1x_env', 'BPFO_1x_env', 'BSF_1x_env', 'wavelet_entropy'],
-        '小波特征': [f'wavelet_energy_{i}' for i in range(8)],
-        'N类专属特征': ['N_autocorr_decay', 'N_noise_level', 'N_impulse_indicator'],
-        '所有特征': df_features.drop(columns=['label', 'rpm', 'filename']).columns.tolist()
-    }
+    try:
+        # 选择最佳模型（这里选择第一个模型）进行详细分析
+        best_model_name = list(y_pred_models.keys())[0]
+        y_pred_best = y_pred_models[best_model_name]
 
-    # 为了简化，我们用特征数量来代表复杂度
-    subset_sizes = {name: len(features) for name, features in feature_subsets.items()}
+        # 计算混淆矩阵
+        cm = confusion_matrix(y_true, y_pred_best)
 
-    # 模拟性能（这里用特征数量的倒数作为复杂度指标，实际应该用交叉验证结果）
-    # 在实际应用中，你应该用真实的模型性能数据
-    performances = {
-        '时域特征': 0.85,
-        '频域特征': 0.82,
-        '小波特征': 0.78,
-        'N类专属特征': 0.80,
-        '所有特征': 0.90
-    }
+        # 绘制热力图
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names)
+        plt.title(f'{best_model_name} 模型混淆矩阵', fontsize=16, weight='bold')
+        plt.xlabel('预测标签')
+        plt.ylabel('真实标签')
 
-    # 绘制对比图
-    fig, ax1 = plt.subplots(figsize=(14, 8))
+        save_path = os.path.join(output_dir, '12_5_confusion_matrix_heatmap.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  - ✅ 综合混淆矩阵热力图已保存至: {save_path}")
 
-    x = np.arange(len(feature_subsets))
-    width = 0.35
-
-    # 绘制性能柱状图
-    performance_bars = ax1.bar(x - width / 2, list(performances.values()), width,
-                               label='准确率', color='skyblue', alpha=0.8)
-    ax1.set_ylabel('准确率', fontsize=12)
-    ax1.set_ylim(0.7, 0.95)
-
-    # 创建第二个y轴显示特征数量
-    ax2 = ax1.twinx()
-    size_bars = ax2.bar(x + width / 2, list(subset_sizes.values()), width,
-                        label='特征数量', color='lightcoral', alpha=0.8)
-    ax2.set_ylabel('特征数量', fontsize=12)
-
-    # 设置x轴标签
-    ax1.set_xlabel('特征子集')
-    ax1.set_title('不同特征子集性能对比', fontsize=16, weight='bold')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(list(feature_subsets.keys()), rotation=45, ha='right')
-
-    # 添加图例
-    ax1.legend(loc='upper left')
-    ax2.legend(loc='upper right')
-
-    # 在柱状图上添加数值标签
-    for bar in performance_bars:
-        height = bar.get_height()
-        ax1.annotate(f'{height:.2f}',
-                     xy=(bar.get_x() + bar.get_width() / 2, height),
-                     xytext=(0, 3),  # 3 points vertical offset
-                     textcoords="offset points",
-                     ha='center', va='bottom')
-
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, '12_7_feature_subset_performance.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  - ✅ 不同特征子集性能对比柱状图已保存至: {save_path}")
+    except Exception as e:
+        print(f"  - ⚠️ 生成综合混淆矩阵热力图时出错: {e}")
 
 
-# 7. 模型性能对比图
-def plot_model_performance_comparison(xgb_report, cnn_report, output_dir):
-    """绘制两个模型性能对比图"""
-    print("  - 正在生成模型性能对比图...")
+# 4. 业务价值导向评价图（安全性-经济性权衡）
+def plot_safety_economy_tradeoff(models_reports, output_dir):
+    """绘制安全性和经济性权衡图"""
+    print("  - 正在生成安全性-经济性权衡图...")
 
-    # 提取各类别指标
-    classes = list(xgb_report.keys())[:-3]  # 排除最后3个汇总行
-    xgb_precision = [xgb_report[c]['precision'] for c in classes]
-    xgb_recall = [xgb_report[c]['recall'] for c in classes]
-    xgb_f1 = [xgb_report[c]['f1-score'] for c in classes]
+    try:
+        models_names = list(models_reports.keys())
+        safety_scores = []  # IR类召回率（安全性）
+        economy_scores = []  # B类精确率（经济性）
 
-    cnn_precision = [cnn_report[c]['precision'] for c in classes]
-    cnn_recall = [cnn_report[c]['recall'] for c in classes]
-    cnn_f1 = [cnn_report[c]['f1-score'] for c in classes]
+        for model_name, report in models_reports.items():
+            ir_recall = report.get('IR', {}).get('recall', 0)
+            b_precision = report.get('B', {}).get('precision', 0)
+            safety_scores.append(ir_recall)
+            economy_scores.append(b_precision)
 
-    # 绘制对比图
-    x = np.arange(len(classes))
-    width = 0.35
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(economy_scores, safety_scores, s=150, alpha=0.7, c=range(len(models_names)),
+                              cmap='viridis')
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # 添加模型名称标签
+        for i, model_name in enumerate(models_names):
+            plt.annotate(model_name, (economy_scores[i], safety_scores[i]),
+                         xytext=(5, 5), textcoords='offset points', fontsize=10, weight='bold')
 
-    # 精确率对比
-    axes[0].bar(x - width / 2, xgb_precision, width, label='XGBoost', color='skyblue', alpha=0.8)
-    axes[0].bar(x + width / 2, cnn_precision, width, label='CNN', color='lightcoral', alpha=0.8)
-    axes[0].set_xlabel('故障类别')
-    axes[0].set_ylabel('精确率')
-    axes[0].set_title('各类别精确率对比')
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(classes)
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+        plt.xlabel('经济性指标 (B类精确率)\n↑ 避免误判，减少不必要停机', fontsize=12)
+        plt.ylabel('安全性指标 (IR类召回率)\n↑ 避免漏检，保障设备安全', fontsize=12)
+        plt.title('模型安全性-经济性权衡分析\n(左上角为理想区域)', fontsize=14, weight='bold')
+        plt.grid(True, alpha=0.3)
 
-    # 召回率对比
-    axes[1].bar(x - width / 2, xgb_recall, width, label='XGBoost', color='skyblue', alpha=0.8)
-    axes[1].bar(x + width / 2, cnn_recall, width, label='CNN', color='lightcoral', alpha=0.8)
-    axes[1].set_xlabel('故障类别')
-    axes[1].set_ylabel('召回率')
-    axes[1].set_title('各类别召回率对比')
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(classes)
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+        # 添加象限参考线 (x=0.98, y=0.98)，代表理想目标
+        plt.axhline(y=0.98, color='r', linestyle='--', alpha=0.5, linewidth=1)
+        plt.axvline(x=0.98, color='r', linestyle='--', alpha=0.5, linewidth=1)
 
-    # F1-score对比
-    axes[2].bar(x - width / 2, xgb_f1, width, label='XGBoost', color='skyblue', alpha=0.8)
-    axes[2].bar(x + width / 2, cnn_f1, width, label='CNN', color='lightcoral', alpha=0.8)
-    axes[2].set_xlabel('故障类别')
-    axes[2].set_ylabel('F1-score')
-    axes[2].set_title('各类别F1-score对比')
-    axes[2].set_xticks(x)
-    axes[2].set_xticklabels(classes)
-    axes[2].legend()
-    axes[2].grid(True, alpha=0.3)
+        # 将坐标轴范围调整到更精细的区间，以突出微小差异
+        plt.xlim(0.96, 1.01)
+        plt.ylim(0.96, 1.01)
 
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, '12_8_model_performance_comparison.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  - ✅ 模型性能对比图已保存至: {save_path}")
+        save_path = os.path.join(output_dir, '12_6_safety_economy_tradeoff.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  - ✅ 安全性-经济性权衡图已保存至: {save_path}")
+
+    except Exception as e:
+        print(f"  - ⚠️ 生成安全性-经济性权衡图时出错: {e}")
+
+
+# 5. 关键风险指标雷达图
+def plot_key_risk_indicators(models_reports, output_dir):
+    """绘制关键风险指标雷达图"""
+    print("  - 正在生成关键风险指标雷达图...")
+
+    try:
+        models_names = list(models_reports.keys())
+
+        # 提取关键指标
+        indicators = ['IR召回率', 'B精确率', 'N召回率', 'OR精确率', '总体准确率']
+        data = {}
+
+        for model_name, report in models_reports.items():
+            data[model_name] = [
+                report.get('IR', {}).get('recall', 0),
+                report.get('B', {}).get('precision', 0),
+                report.get('N', {}).get('recall', 0),
+                report.get('OR', {}).get('precision', 0),
+                report.get('accuracy', 0)
+            ]
+
+        # 绘制雷达图
+        labels = np.array(indicators)
+        num_vars = len(labels)
+        angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
+        angles += angles[:1]  # 闭合图形
+
+        fig, ax = plt.subplots(figsize=(12, 10), subplot_kw=dict(projection='polar'))
+
+        colors = ['red', 'blue', 'green', 'orange', 'purple']
+        for i, (model_name, values) in enumerate(data.items()):
+            values += values[:1]  # 闭合图形
+            ax.plot(angles, values, 'o-', linewidth=2, label=model_name, color=colors[i % len(colors)])
+            ax.fill(angles, values, alpha=0.25, color=colors[i % len(colors)])
+
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(labels, fontsize=11)
+        ax.set_ylim(0, 1)
+        ax.set_title('关键风险指标雷达图\n(越靠近边缘越好)', size=16, weight='bold', pad=30)
+        ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
+        ax.grid(True, alpha=0.3)
+
+        save_path = os.path.join(output_dir, '12_7_key_risk_indicators.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  - ✅ 关键风险指标雷达图已保存至: {save_path}")
+
+    except Exception as e:
+        print(f"  - ⚠️ 生成关键风险指标雷达图时出错: {e}")
+
+
+# 6. 综合性能评分卡
+def plot_comprehensive_scorecard(models_reports, output_dir):
+    """绘制综合性能评分卡"""
+    print("  - 正在生成综合性能评分卡...")
+
+    try:
+        models_names = list(models_reports.keys())
+
+        # 定义评分维度和权重
+        scoring_criteria = {
+            'accuracy': 0.3,  # 总体准确率 30%
+            'IR_recall': 0.25,  # IR召回率 25%
+            'B_precision': 0.2,  # B精确率 20%
+            'N_recall': 0.15,  # N召回率 15%
+            'macro_f1': 0.1  # 宏平均F1 10%
+        }
+
+        # 计算各模型综合得分
+        scores = {}
+        for model_name, report in models_reports.items():
+            score = 0
+            score += report.get('accuracy', 0) * scoring_criteria['accuracy']
+            score += report.get('IR', {}).get('recall', 0) * scoring_criteria['IR_recall']
+            score += report.get('B', {}).get('precision', 0) * scoring_criteria['B_precision']
+            score += report.get('N', {}).get('recall', 0) * scoring_criteria['N_recall']
+            # 使用 'macro avg' 或直接从报告中获取宏F1
+            macro_f1 = report.get('macro avg', {}).get('f1-score', 0)
+            if macro_f1 == 0:
+                # 如果 'macro avg' 键不存在，尝试从 'weighted avg' 或其他方式获取，或者用0代替
+                macro_f1 = 0
+            score += macro_f1 * scoring_criteria['macro_f1']
+            scores[model_name] = score * 100  # 转换为百分制
+
+        # 绘制评分卡
+        plt.figure(figsize=(16, 6))
+
+        # 左侧：综合得分柱状图
+        models_list = list(scores.keys())
+        scores_list = list(scores.values())
+
+        bars = plt.bar(models_list, scores_list, color=['skyblue', 'lightgreen', 'lightcoral'], alpha=0.8)
+        plt.ylabel('综合得分 (满分100)', fontsize=12)
+        plt.title('模型综合性能评分卡\n(加权多维度评估)', fontsize=14, weight='bold')
+        plt.grid(True, alpha=0.3, axis='y')
+
+        # 添加数值标签
+        for bar, score in zip(bars, scores_list):
+            plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                     f'{score:.1f}', ha='center', va='bottom', fontsize=12, weight='bold')
+
+        plt.ylim(0, 100)
+        plt.xticks(rotation=45)
+
+        # 右侧：最佳模型详细性能雷达图
+        # 找到综合得分最高的模型
+        best_model = max(scores, key=scores.get)
+        best_report = models_reports[best_model]
+
+        # 定义一个函数来安全地获取数值
+        def get_safe_value(report, key, default=0):
+            try:
+                if isinstance(report, dict):
+                    return report.get(key, default)
+                else:
+                    return default
+            except:
+                return default
+
+        # 使用安全函数获取雷达图数据
+        radar_values = [
+            get_safe_value(best_report, 'accuracy'),
+            get_safe_value(best_report, 'IR', {}).get('recall', 0),
+            get_safe_value(best_report, 'B', {}).get('precision', 0),
+            get_safe_value(best_report, 'N', {}).get('recall', 0),
+            get_safe_value(best_report, 'macro avg', {}).get('f1-score', 0)
+        ]
+
+        # 确保数组长度正确
+        if len(radar_values) != 5:
+            print(f"⚠️ 警告: {best_model} 的雷达图数据长度异常，已填充默认值")
+            radar_values = [0] * 5  # 或者根据实际情况处理
+
+        # 绘制雷达图
+        ax2 = plt.subplot(1, 2, 2, projection='polar')
+        angles = np.linspace(0, 2 * np.pi, 5, endpoint=False).tolist()
+        angles += angles[:1]
+        radar_values += radar_values[:1]
+
+        ax2.plot(angles, radar_values, 'o-', linewidth=2, label=best_model, color='red')
+        ax2.fill(angles, radar_values, alpha=0.25, color='red')
+        ax2.set_xticks(angles[:-1])
+        ax2.set_xticklabels(['accuracy', 'IR_recall', 'B_precision', 'N_recall', 'macro_f1'], fontsize=10)
+        ax2.set_ylim(0, 1)
+        ax2.set_title(f'{best_model} 详细性能雷达图', size=14, weight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path = os.path.join(output_dir, '12_10_comprehensive_scorecard.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  - ✅ 综合性能评分卡已保存至: {save_path}")
+
+    except Exception as e:
+        print(f"  - ⚠️ 生成综合性能评分卡时出错: {e}")
+
+
+# 7. 细化混淆矩阵（突出 IR/N）
+def plot_detailed_confusion_matrix(y_true, y_pred_models, class_names, output_dir):
+    """绘制细化的混淆矩阵，突出显示 IR 和 N 类"""
+    print("  - 正在生成细化混淆矩阵图...")
+
+    try:
+        # 假设 IR 是 'IR'，N 是 'N'
+        ir_index = list(class_names).index('IR')
+        n_index = list(class_names).index('N')
+        target_indices = [ir_index, n_index]
+        target_labels = ['IR', 'N']
+
+        for model_name, y_pred in y_pred_models.items():
+            # 计算完整混淆矩阵
+            cm_full = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
+
+            # 提取 IR 和 N 的子矩阵
+            cm_sub = cm_full[np.ix_(target_indices, target_indices)]
+
+            # 绘制 IR/N 子矩阵
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(cm_sub, annot=True, fmt='d', cmap='Reds',  # 使用红色系突出
+                        xticklabels=target_labels, yticklabels=target_labels,
+                        cbar_kws={"shrink": .8})
+            plt.title(f'{model_name} 模型 IR/N 类混淆矩阵', fontsize=14, weight='bold')
+            plt.xlabel('预测标签')
+            plt.ylabel('真实标签')
+            plt.tight_layout()
+
+            save_path = os.path.join(output_dir, f'13_detailed_cm_{model_name}_IR_N.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"  - ✅ {model_name} 细化混淆矩阵 (IR/N) 已保存至: {save_path}")
+
+    except Exception as e:
+        print(f"  - ⚠️ 生成细化混淆矩阵图时出错: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# 8. 关键类性能稳定性图（方案B：简化版）
+def plot_key_class_performance_summary(models_reports, output_dir):
+    """绘制关键类性能汇总图（简化版，非跨折稳定性）"""
+    print("  - 正在生成关键类性能汇总图...")
+    try:
+        models_names = list(models_reports.keys())
+        ir_recalls = [models_reports[m].get('IR', {}).get('recall', 0) for m in models_names]
+        n_recalls = [models_reports[m].get('N', {}).get('recall', 0) for m in models_names]
+        n_f1s = [models_reports[m].get('N', {}).get('f1-score', 0) for m in models_names]
+
+        x = np.arange(len(models_names))  # 标签位置
+        width = 0.25  # 柱状图的宽度
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        rects1 = ax.bar(x - width, ir_recalls, width, label='IR 召回率', color='skyblue')
+        rects2 = ax.bar(x, n_recalls, width, label='N 召回率', color='lightcoral')
+        rects3 = ax.bar(x + width, n_f1s, width, label='N F1分数', color='lightgreen')
+
+        # 添加数值标签
+        def autolabel(rects):
+            for rect in rects:
+                height = rect.get_height()
+                ax.annotate(f'{height:.2f}',
+                            xy=(rect.get_x() + rect.get_width() / 2, height),
+                            xytext=(0, 3),  # 3 points vertical offset
+                            textcoords="offset points",
+                            ha='center', va='bottom', fontsize=9)
+
+        autolabel(rects1)
+        autolabel(rects2)
+        autolabel(rects3)
+
+        ax.set_ylabel('分数')
+        ax.set_title('各模型关键类 (IR, N) 性能汇总')
+        ax.set_xticks(x)
+        ax.set_xticklabels(models_names)
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+        plt.tight_layout()
+
+        save_path = os.path.join(output_dir, '14_key_class_performance_summary.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  - ✅ 关键类性能汇总图已保存至: {save_path}")
+
+    except Exception as e:
+        print(f"  - ⚠️ 生成关键类性能汇总图时出错: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # 主程序
@@ -441,9 +536,6 @@ if __name__ == "__main__":
     # 加载数据
     PROCESSED_DIR = os.path.join('..', 'data', 'processed')
     FEATURES_PATH = os.path.join(PROCESSED_DIR, 'source_features_selected.csv')
-    SEGMENTS_PATH = os.path.join(PROCESSED_DIR, 'source_segments.npy')
-    LABELS_PATH = os.path.join(PROCESSED_DIR, 'source_labels.npy')
-    RPMS_PATH = os.path.join(PROCESSED_DIR, 'source_rpms.npy')
 
     try:
         # 加载特征数据
@@ -453,70 +545,110 @@ if __name__ == "__main__":
         le = LabelEncoder()
         y = le.fit_transform(y_str)
 
-        # 加载原始分段数据用于时频分析
-        segments = np.load(SEGMENTS_PATH)
-        labels = np.load(LABELS_PATH)
-        rpms = np.load(RPMS_PATH)
-
         print(f"成功加载数据: {len(X_raw)} 个样本")
 
         # 加载训练好的模型
         XGB_MODEL_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_xgb_model.joblib')
-        CNN_MODEL_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_cnn_model.h5')
+        RF_MODEL_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_rf_model.joblib')
+        # --- 修改点1: 更正变量名 ---
+        CNN_LSTM_WEIGHTS_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_cnn_lstm_model.weights.h5')
+        SCALER_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_scaler.joblib')
 
-        # 1. SHAP特征重要性图 (XGBoost)
+        models = {}
         if os.path.exists(XGB_MODEL_PATH):
-            model = joblib.load(XGB_MODEL_PATH)
+            models['XGBoost'] = joblib.load(XGB_MODEL_PATH)
             print("成功加载XGBoost模型")
-            plot_shap_feature_importance(X_raw.values, model, X_raw.columns, output_dir)
         else:
-            print("未找到XGBoost模型，跳过SHAP分析")
+            print("未找到XGBoost模型")
 
-        # 2. CNN注意力权重分析
-        if os.path.exists(CNN_MODEL_PATH):
-            cnn_model = tf.keras.models.load_model(CNN_MODEL_PATH)
-            print("成功加载CNN模型")
-            # 准备样本数据用于注意力分析
-            scaler_path = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_scaler.joblib')
-            if os.path.exists(scaler_path):
-                scaler = joblib.load(scaler_path)
-                X_scaled = scaler.transform(X_raw)
-                X_cnn_sample = np.expand_dims(X_scaled[:100], axis=2)  # 取前100个样本
-                plot_cnn_attention_weights(cnn_model, X_cnn_sample, output_dir)
+        if os.path.exists(RF_MODEL_PATH):
+            models['RandomForest'] = joblib.load(RF_MODEL_PATH)
+            print("成功加载随机森林模型")
         else:
-            print("未找到CNN模型，跳过注意力分析")
+            print("未找到随机森林模型")
 
-        # 3. 各类别决策关键特征雷达图
-        plot_decision_key_features_radar(df_features, output_dir)
+        # --- 修改点2: 移除旧的加载逻辑，添加新的加载权重逻辑 ---
+        # if os.path.exists(CNN_LSTM_MODEL_PATH):
+        #     models['CNN-LSTM'] = tf.keras.models.load_model(CNN_LSTM_MODEL_PATH)  # 新增加载CNN-LSTM
+        #     print("成功加载CNN-LSTM模型")
+        # else:
+        #     print("未找到CNN-LSTM模型")
 
-        # 4. 混淆样本时频特征对比图
-        plot_confused_samples_comparison(segments, labels, rpms, output_dir)
+        # --- 新增：加载 CNN-LSTM 模型权重 ---
+        if os.path.exists(CNN_LSTM_WEIGHTS_PATH):
+            # 1. 获取模型输入形状和类别数
+            input_shape = (X_raw.shape[1], 1)  # (特征数, 1)
+            num_classes = len(np.unique(y))    # 类别数
 
-        # 5. 错误分类样本特征分布热力图（需要预测结果）
-        # 这里简化处理，使用随机预测结果作为示例
-        y_pred = np.random.choice(y, len(y))  # 实际应该使用模型预测结果
-        plot_misclassified_features_heatmap(df_features, y, y_pred, le, output_dir)
+            # 2. 重新创建模型架构 (使用上面定义的函数)
+            reconstructed_cnn_lstm_model = create_cnn_lstm_model(input_shape, num_classes)
 
-        # 6. 不同特征子集性能对比柱状图
-        plot_feature_subset_performance(df_features, output_dir)
+            # 3. 加载权重到重建的模型中
+            reconstructed_cnn_lstm_model.load_weights(CNN_LSTM_WEIGHTS_PATH)
+            models['CNN-LSTM'] = reconstructed_cnn_lstm_model
+            print("成功加载CNN-LSTM模型 (通过权重)")
+        else:
+            print("未找到CNN-LSTM模型权重文件")
+        # --- 新增结束 ---
 
-        # 7. 模型性能对比图（使用11脚本中的结果）
-        # 这里使用模拟数据，实际应该使用真实的分类报告
-        xgb_report = {
-            'B': {'precision': 0.84, 'recall': 0.83, 'f1-score': 0.84},
-            'IR': {'precision': 1.00, 'recall': 0.96, 'f1-score': 0.98},
-            'N': {'precision': 1.00, 'recall': 0.83, 'f1-score': 0.90},
-            'OR': {'precision': 0.86, 'recall': 0.94, 'f1-score': 0.90}
-        }
+        # 1. SHAP特征重要性图 (XGBoost) - 修复版
+        if 'XGBoost' in models:
+            plot_shap_feature_importance(X_raw, models['XGBoost'], X_raw.columns, output_dir)
 
-        cnn_report = {
-            'B': {'precision': 0.73, 'recall': 0.88, 'f1-score': 0.80},
-            'IR': {'precision': 1.00, 'recall': 0.99, 'f1-score': 1.00},
-            'N': {'precision': 1.00, 'recall': 1.00, 'f1-score': 1.00},
-            'OR': {'precision': 0.94, 'recall': 0.87, 'f1-score': 0.90}
-        }
+        # 2. 模型性能评估
+        if os.path.exists(SCALER_PATH):
+            scaler = joblib.load(SCALER_PATH)
+            X_scaled = scaler.transform(X_raw)
 
-        plot_model_performance_comparison(xgb_report, cnn_report, output_dir)
+            # 获取预测结果和真实标签
+            y_true = y
+
+            # 计算各模型准确率和分类报告
+            accuracies = {}
+            reports = {}
+            y_pred_models = {}  # 保存各模型预测结果
+
+            for model_name, model in models.items():
+                try:
+                    if model_name == 'XGBoost':
+                        y_pred = model.predict(X_scaled)
+                    elif model_name == 'RandomForest':
+                        y_pred = model.predict(X_scaled)
+                    elif model_name == 'CNN-LSTM':
+                        # 注意：CNN-LSTM模型的输入需要是3D张量
+                        X_scaled_cnn = np.expand_dims(X_scaled, axis=2)
+                        y_pred_prob = model.predict(X_scaled_cnn)
+                        y_pred = np.argmax(y_pred_prob, axis=1)
+                    else:
+                        continue
+
+                    accuracy = accuracy_score(y_true, y_pred)
+                    report = classification_report(y_true, y_pred, target_names=le.classes_, output_dict=True)
+
+                    accuracies[model_name] = accuracy
+                    reports[model_name] = report
+                    y_pred_models[model_name] = y_pred  # 保存预测结果
+
+                    print(f"  - {model_name} 准确率: {accuracy:.4f}")
+                except Exception as e:
+                    print(f"  - ⚠️ 计算 {model_name} 性能时出错: {e}")
+
+            # 生成核心诊断结果评价可视化图表
+            if reports:
+                # 生成所有评价图表
+                plot_safety_economy_tradeoff(reports, output_dir)  # 安全性-经济性权衡
+                plot_key_risk_indicators(reports, output_dir)  # 关键风险指标雷达图
+                plot_comprehensive_scorecard(reports, output_dir)  # 综合性能评分卡
+                # --- 新增调用 ---
+                plot_detailed_confusion_matrix(y_true, y_pred_models, le.classes_, output_dir)  # <--- 添加这行
+                plot_key_class_performance_summary(reports, output_dir)  # <--- 添加这行
+
+            # 3. 类别分布饼图 (作为背景信息)
+            plot_class_distribution(y_true, le.classes_, output_dir)
+
+            # 4. 综合混淆矩阵热力图
+            if y_pred_models:
+                plot_confusion_matrix_heatmap(y_true, y_pred_models, le.classes_, output_dir)
 
         print(f"\n🎉 任务二额外可视化图表已全部生成并保存至: {os.path.abspath(output_dir)}")
 
