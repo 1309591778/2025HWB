@@ -11,63 +11,70 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from sklearn.ensemble import RandomForestClassifier
 import shap
+# 注意：移除了 CNN-LSTM 相关的 layers 导入，因为 MLP-DA 不需要它们
+# from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, ReLU, MaxPooling1D, LSTM, \
+#     GlobalAveragePooling1D, Dense, Dropout, multiply, Activation
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, ReLU, MaxPooling1D, LSTM, \
-    GlobalAveragePooling1D, Dense, Dropout, multiply, Activation
+from tensorflow.keras.layers import Input, Dense, Dropout, Lambda # 导入 MLP-DA 需要的层
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping
+# --- 新增：导入 GradReverse 层定义 ---
+@tf.custom_gradient
+def grad_reverse(x, lambda_val=1.0):
+    """梯度反转函数"""
+    y = tf.identity(x)
+    def custom_grad(dy):
+        return -dy * lambda_val, None
+    return y, custom_grad
 
-# ==================== 添加模型定义函数 ====================
-def categorical_focal_loss(gamma=2., alpha=0.25):
+class GradReverse(tf.keras.layers.Layer):
+    """梯度反转层 Keras 封装"""
+    def __init__(self, lambda_val=1.0, **kwargs):
+        super(GradReverse, self).__init__(**kwargs)
+        self.lambda_val = lambda_val
+    def call(self, x):
+        return grad_reverse(x, self.lambda_val)
+    def get_config(self):
+        config = super(GradReverse, self).get_config()
+        config.update({'lambda_val': self.lambda_val})
+        return config
+# --- 新增结束 ---
+
+# ==================== 添加 MLP-DA 模型定义函数 ====================
+# --- 新增：定义与训练时完全一致的 MLP-DA 模型架构 ---
+def create_mlp_da_model(input_dim, num_classes, lambda_grl=1.0):
     """
-    Focal Loss for addressing class imbalance in categorical classification
+    创建用于源域训练的简化 MLP 模型，包含领域自适应组件。
     """
-    def categorical_focal_loss_fixed(y_true, y_pred):
-        epsilon = tf.keras.backend.epsilon()
-        y_pred = tf.keras.backend.clip(y_pred, epsilon, 1. - epsilon)
-        cross_entropy = -y_true * tf.keras.backend.log(y_pred)
-        weight = alpha * y_true * tf.keras.backend.pow((1 - y_pred), gamma)
-        loss = weight * cross_entropy
-        loss = tf.keras.backend.sum(loss, axis=1)
-        return loss
+    # 1. 输入层
+    inputs = Input(shape=(input_dim,))
 
-    return categorical_focal_loss_fixed
+    # 2. 特征提取器 (MLP)
+    shared = Dense(128, activation='relu', name='feature_extractor_1')(inputs)
+    shared = Dropout(0.5)(shared)
+    shared = Dense(64, activation='relu', name='feature_extractor_2')(shared)
+    shared = Dropout(0.5)(shared)
+    features_before_grl = Dense(32, activation='relu', name='feature_extractor_3')(shared)
 
+    # --- 新增：领域自适应分支 ---
+    # 3a. 梯度反转层 (GRL)
+    grl = GradReverse(lambda_val=lambda_grl)(features_before_grl)
 
-def create_cnn_lstm_model(input_shape, num_classes):
-    """创建简单的CNN+LSTM模型"""
-    inputs = Input(shape=input_shape)
+    # 3b. 领域判别器 (Domain Discriminator)
+    d_net = Dense(32, activation='relu')(grl)
+    d_net = Dropout(0.5)(d_net)
+    domain_output = Dense(1, activation='sigmoid', name='domain_output')(d_net)
+    # --- 新增结束 ---
 
-    # CNN特征提取层
-    x = Conv1D(filters=64, kernel_size=3, padding='same')(inputs)
-    x = BatchNormalization()(x)
-    x = ReLU()(x)
-    x = MaxPooling1D(pool_size=2, padding='same')(x)
+    # 4. 主任务分类头
+    c_net = Dense(64, activation='relu')(features_before_grl)
+    c_net = Dropout(0.5)(c_net)
+    class_output = Dense(num_classes, activation='softmax', name='class_output')(c_net)
 
-    x = Conv1D(filters=128, kernel_size=3, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = ReLU()(x)
-    x = MaxPooling1D(pool_size=2, padding='same')(x)
-
-    # LSTM时序建模层
-    x = LSTM(64, return_sequences=True)(x)
-    x = LSTM(32, return_sequences=False)(x)
-
-    # 全连接分类层
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
-
-    model = Model(inputs=inputs, outputs=outputs)
-
-    # 注意：在加载权重时，通常不需要编译模型。
-    # 但如果后续需要（例如微调），可以取消下面的注释并确保 categorical_focal_loss 可用。
-    # model.compile(
-    #     optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-    #     loss=categorical_focal_loss(gamma=2., alpha=0.5),
-    #     metrics=['accuracy']
-    # )
+    # 5. 构建模型
+    model = Model(inputs=inputs, outputs=[class_output, domain_output])
+    # 注意：可视化时不需要编译模型
     return model
+# --- 新增结束 ---
 # ==================== 添加模型定义函数结束 ====================
 
 
@@ -240,11 +247,18 @@ def plot_safety_economy_tradeoff(models_reports, output_dir):
         safety_scores = []  # IR类召回率（安全性）
         economy_scores = []  # B类精确率（经济性）
 
+        # --- 新增调试信息 ---
+        print(f"  - Debug: 准备绘制 {len(models_names)} 个模型: {models_names}")
+        # --- 新增调试信息结束 ---
+
         for model_name, report in models_reports.items():
             ir_recall = report.get('IR', {}).get('recall', 0)
             b_precision = report.get('B', {}).get('precision', 0)
             safety_scores.append(ir_recall)
             economy_scores.append(b_precision)
+            # --- 新增调试信息 ---
+            print(f"    - Debug: {model_name} -> IR Recall: {ir_recall:.4f}, B Precision: {b_precision:.4f}")
+            # --- 新增调试信息结束 ---
 
         plt.figure(figsize=(10, 8))
         scatter = plt.scatter(economy_scores, safety_scores, s=150, alpha=0.7, c=range(len(models_names)),
@@ -265,7 +279,7 @@ def plot_safety_economy_tradeoff(models_reports, output_dir):
         plt.axvline(x=0.98, color='r', linestyle='--', alpha=0.5, linewidth=1)
 
         # 将坐标轴范围调整到更精细的区间，以突出微小差异
-        plt.xlim(0.96, 1.01)
+        plt.xlim(0.85, 1.01)
         plt.ylim(0.96, 1.01)
 
         save_path = os.path.join(output_dir, '12_6_safety_economy_tradeoff.png')
@@ -275,6 +289,9 @@ def plot_safety_economy_tradeoff(models_reports, output_dir):
 
     except Exception as e:
         print(f"  - ⚠️ 生成安全性-经济性权衡图时出错: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 
 # 5. 关键风险指标雷达图
@@ -550,8 +567,8 @@ if __name__ == "__main__":
         # 加载训练好的模型
         XGB_MODEL_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_xgb_model.joblib')
         RF_MODEL_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_rf_model.joblib')
-        # --- 修改点1: 更正变量名 ---
-        CNN_LSTM_WEIGHTS_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_cnn_lstm_model.weights.h5')
+        # --- 修改点1: 更正变量名，指向 MLP-DA 模型权重 ---
+        MLP_DA_WEIGHTS_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_mlp_da_model.weights.h5') # <--- 修改这里
         SCALER_PATH = os.path.join(PROCESSED_DIR, 'task2_outputs_final', 'final_scaler.joblib')
 
         models = {}
@@ -567,28 +584,28 @@ if __name__ == "__main__":
         else:
             print("未找到随机森林模型")
 
-        # --- 修改点2: 移除旧的加载逻辑，添加新的加载权重逻辑 ---
+        # --- 修改点2: 移除旧的 CNN-LSTM 加载逻辑，添加新的 MLP-DA 加载权重逻辑 ---
         # if os.path.exists(CNN_LSTM_MODEL_PATH):
-        #     models['CNN-LSTM'] = tf.keras.models.load_model(CNN_LSTM_MODEL_PATH)  # 新增加载CNN-LSTM
+        #     models['CNN-LSTM'] = tf.keras.models.load_model(CNN_LSTM_MODEL_PATH)
         #     print("成功加载CNN-LSTM模型")
         # else:
         #     print("未找到CNN-LSTM模型")
 
-        # --- 新增：加载 CNN-LSTM 模型权重 ---
-        if os.path.exists(CNN_LSTM_WEIGHTS_PATH):
-            # 1. 获取模型输入形状和类别数
-            input_shape = (X_raw.shape[1], 1)  # (特征数, 1)
+        # --- 新增：加载 MLP-DA 模型权重 ---
+        if os.path.exists(MLP_DA_WEIGHTS_PATH): # <--- 修改这里
+            # 1. 获取模型输入维度和类别数
+            input_dim = X_raw.shape[1]  # (特征数)
             num_classes = len(np.unique(y))    # 类别数
 
             # 2. 重新创建模型架构 (使用上面定义的函数)
-            reconstructed_cnn_lstm_model = create_cnn_lstm_model(input_shape, num_classes)
+            reconstructed_mlp_da_model = create_mlp_da_model(input_dim, num_classes) # <--- 修改这里
 
             # 3. 加载权重到重建的模型中
-            reconstructed_cnn_lstm_model.load_weights(CNN_LSTM_WEIGHTS_PATH)
-            models['CNN-LSTM'] = reconstructed_cnn_lstm_model
-            print("成功加载CNN-LSTM模型 (通过权重)")
+            reconstructed_mlp_da_model.load_weights(MLP_DA_WEIGHTS_PATH) # <--- 修改这里
+            models['MLP-DA'] = reconstructed_mlp_da_model # <--- 修改模型字典中的键名
+            print("成功加载MLP-DA模型 (通过权重)") # <--- 修改这里
         else:
-            print("未找到CNN-LSTM模型权重文件")
+            print("未找到MLP-DA模型权重文件") # <--- 修改这里
         # --- 新增结束 ---
 
         # 1. SHAP特征重要性图 (XGBoost) - 修复版
@@ -614,11 +631,17 @@ if __name__ == "__main__":
                         y_pred = model.predict(X_scaled)
                     elif model_name == 'RandomForest':
                         y_pred = model.predict(X_scaled)
-                    elif model_name == 'CNN-LSTM':
-                        # 注意：CNN-LSTM模型的输入需要是3D张量
-                        X_scaled_cnn = np.expand_dims(X_scaled, axis=2)
-                        y_pred_prob = model.predict(X_scaled_cnn)
-                        y_pred = np.argmax(y_pred_prob, axis=1)
+                    # --- 修改点3: 修改 MLP-DA 模型的预测逻辑 ---
+                    # elif model_name == 'CNN-LSTM':
+                    #     # 注意：CNN-LSTM模型的输入需要是3D张量
+                    #     X_scaled_cnn = np.expand_dims(X_scaled, axis=2)
+                    #     y_pred_prob = model.predict(X_scaled_cnn)
+                    #     y_pred = np.argmax(y_pred_prob, axis=1)
+                    elif model_name == 'MLP-DA': # <--- 修改这里
+                        # MLP-DA 模型的输入是2D张量 (samples, features)
+                        # 输出是 [class_output_probabilities, domain_output_probabilities]
+                        y_pred_prob, _ = model.predict(X_scaled) # <--- 修改这里
+                        y_pred = np.argmax(y_pred_prob, axis=1)   # <--- 修改这里
                     else:
                         continue
 
@@ -629,7 +652,7 @@ if __name__ == "__main__":
                     reports[model_name] = report
                     y_pred_models[model_name] = y_pred  # 保存预测结果
 
-                    print(f"  - {model_name} 准确率: {accuracy:.4f}")
+                    print(f"  - {model_name} 准确率: {accuracy:.4f}") # <--- 这里会打印 MLP-DA 的准确率
                 except Exception as e:
                     print(f"  - ⚠️ 计算 {model_name} 性能时出错: {e}")
 
@@ -640,8 +663,8 @@ if __name__ == "__main__":
                 plot_key_risk_indicators(reports, output_dir)  # 关键风险指标雷达图
                 plot_comprehensive_scorecard(reports, output_dir)  # 综合性能评分卡
                 # --- 新增调用 ---
-                plot_detailed_confusion_matrix(y_true, y_pred_models, le.classes_, output_dir)  # <--- 添加这行
-                plot_key_class_performance_summary(reports, output_dir)  # <--- 添加这行
+                plot_detailed_confusion_matrix(y_true, y_pred_models, le.classes_, output_dir)
+                plot_key_class_performance_summary(reports, output_dir)
 
             # 3. 类别分布饼图 (作为背景信息)
             plot_class_distribution(y_true, le.classes_, output_dir)

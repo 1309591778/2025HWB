@@ -1,3 +1,4 @@
+# 11_task2_source_domain_modeling.py
 import os
 import pandas as pd
 import numpy as np
@@ -6,20 +7,16 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.ensemble import RandomForestClassifier  # 添加随机森林
+from sklearn.ensemble import RandomForestClassifier
 import joblib
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, ReLU, MaxPooling1D, LSTM, \
-    GlobalAveragePooling1D, Dense, Dropout, multiply, Activation
+from tensorflow.keras.layers import Input, Dense, Dropout, Lambda
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.callbacks import EarlyStopping
-# 修正import语句
-from sklearn.utils.class_weight import compute_class_weight  # 正确的函数名
-# 在现有导入后添加
+from sklearn.utils.class_weight import compute_class_weight
 import xgboost as xgb
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 
 # ==============================================================================
@@ -32,90 +29,98 @@ def set_chinese_font():
     print("✅ 已设置中文字体。")
 
 
-def categorical_focal_loss(gamma=2., alpha=None): # <--- alpha 可以是列表或 None
+# --- 新增：定义梯度反转层 (Gradient Reversal Layer) ---
+@tf.custom_gradient
+def grad_reverse(x, lambda_val=1.0):
+    """梯度反转函数"""
+    y = tf.identity(x)
+
+    def custom_grad(dy):
+        return -dy * lambda_val, None
+
+    return y, custom_grad
+
+
+class GradReverse(tf.keras.layers.Layer):
+    """梯度反转层 Keras 封装"""
+
+    def __init__(self, lambda_val=1.0, **kwargs):
+        super(GradReverse, self).__init__(**kwargs)
+        self.lambda_val = lambda_val
+
+    def call(self, x):
+        return grad_reverse(x, self.lambda_val)
+
+    def get_config(self):
+        config = super(GradReverse, self).get_config()
+        config.update({'lambda_val': self.lambda_val})
+        return config
+
+
+# --- 新增结束 ---
+
+
+# --- 修改：定义包含领域自适应的简化 MLP 模型 ---
+def create_mlp_da_model(input_dim, num_classes, lambda_grl=1.0):
     """
-    Focal Loss for addressing class imbalance in categorical classification.
-    Supports per-class alpha weights.
+    创建用于源域训练的简化 MLP 模型，包含领域自适应组件。
     """
-    def categorical_focal_loss_fixed(y_true, y_pred):
-        epsilon = tf.keras.backend.epsilon()
-        y_pred = tf.keras.backend.clip(y_pred, epsilon, 1. - epsilon)
-        cross_entropy = -y_true * tf.keras.backend.log(y_pred)
+    # 1. 输入层
+    inputs = Input(shape=(input_dim,))
 
-        # --- 修改点：支持 alpha 为列表 ---
-        if alpha is not None:
-            # 假设 alpha 是一个列表或 numpy array，长度等于类别数
-            # y_true 是 one-hot 编码，shape [batch_size, num_classes]
-            # alpha 需要 reshape 成 [1, num_classes] 以便广播
-            alpha_tensor = tf.constant(alpha, dtype=tf.float32)
-            alpha_tensor = tf.reshape(alpha_tensor, [1, -1])
-            # weight = alpha * y_true * (1 - y_pred)^gamma
-            weight = alpha_tensor * y_true * tf.keras.backend.pow((1 - y_pred), gamma)
-        else:
-            # 如果 alpha 为 None，则不使用权重
-            weight = y_true * tf.keras.backend.pow((1 - y_pred), gamma)
-        # --- 修改结束 ---
+    # 2. 特征提取器 (MLP)
+    shared = Dense(128, activation='relu', name='feature_extractor_1')(inputs)
+    shared = Dropout(0.5)(shared)
+    shared = Dense(64, activation='relu', name='feature_extractor_2')(shared)
+    shared = Dropout(0.5)(shared)
+    features_before_grl = Dense(32, activation='relu', name='feature_extractor_3')(shared)
 
-        loss = weight * cross_entropy
-        loss = tf.keras.backend.sum(loss, axis=1)
-        return loss
-    return categorical_focal_loss_fixed
+    # --- 新增：领域自适应分支 ---
+    # 3a. 梯度反转层 (GRL)
+    grl = GradReverse(lambda_val=lambda_grl)(features_before_grl)
 
+    # 3b. 领域判别器 (Domain Discriminator)
+    d_net = Dense(32, activation='relu')(grl)
+    d_net = Dropout(0.5)(d_net)
+    domain_output = Dense(1, activation='sigmoid', name='domain_output')(d_net)
+    # --- 新增结束 ---
 
-def create_cnn_lstm_model(input_shape, num_classes):
-    """创建简单的CNN+LSTM模型"""
-    inputs = Input(shape=input_shape)
+    # 4. 主任务分类头
+    c_net = Dense(64, activation='relu')(features_before_grl)
+    c_net = Dropout(0.5)(c_net)
+    class_output = Dense(num_classes, activation='softmax', name='class_output')(c_net)
 
-    # CNN特征提取层
-    x = Conv1D(filters=64, kernel_size=3, padding='same')(inputs)
-    x = BatchNormalization()(x)
-    x = ReLU()(x)
-    x = MaxPooling1D(pool_size=2, padding='same')(x)
+    # 5. 构建模型
+    model = Model(inputs=inputs, outputs=[class_output, domain_output])
 
-    x = Conv1D(filters=128, kernel_size=3, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = ReLU()(x)
-    x = MaxPooling1D(pool_size=2, padding='same')(x)
-
-    # LSTM时序建模层
-    x = LSTM(64, return_sequences=True)(x)
-    x = LSTM(32, return_sequences=False)(x)
-
-    # 全连接分类层
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
-
-    model = Model(inputs=inputs, outputs=outputs)
-
-    # 使用Focal Loss替代标准交叉熵损失
-    num_classes = len(le.classes_)  # 通常是 4
-    # 创建 alpha 列表，索引对应类别
-    # 例如，给 B 类 (索引 0) 更高的权重
-    alpha_list = [0.25] * num_classes  # 默认所有类权重 0.25
-    b_class_index = 0  # 确认 B 类索引
-    alpha_list[b_class_index] = 0.75  # 给 B 类更高的权重 (例如 0.75)
-
+    # 编译模型
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss=categorical_focal_loss(gamma=2., alpha=alpha_list),  # <--- 使用 alpha 列表
-        metrics=['accuracy']
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss={
+            'class_output': 'categorical_crossentropy',
+            'domain_output': 'binary_crossentropy'
+        },
+        loss_weights={
+            'class_output': 1.0,
+            'domain_output': 1.0  # 可以调整这个权重 lambda_domain
+        },
+        metrics={
+            'class_output': 'accuracy',
+            'domain_output': 'accuracy'
+        }
     )
+
     return model
+
+
+# --- 修改结束 ---
 
 
 def compute_balanced_sample_weights(y, n_class_index=2, n_class_weight=3.0):
     """计算平衡的样本权重，给N类更高的权重"""
-    # 获取类别数量
     n_classes = len(np.unique(y))
-
-    # 默认权重为1.0
     class_weights = {i: 1.0 for i in range(n_classes)}
-
-    # 给N类（假设索引为2）更高的权重
     class_weights[n_class_index] = n_class_weight
-
-    # 为每个样本分配权重
     sample_weights = np.array([class_weights[label] for label in y])
     return sample_weights
 
@@ -128,22 +133,20 @@ def create_xgb_model_params():
     params = {
         'objective': 'multi:softprob',
         'eval_metric': 'mlogloss',
-        'num_class': 4,  # 假设有4个类别
+        'num_class': 4,
         'random_state': 42,
-        # 优化参数
-        'max_depth': 6,          # 降低深度避免过拟合
-        'learning_rate': 0.1,    # 提高学习率
+        'max_depth': 6,
+        'learning_rate': 0.1,
         'subsample': 0.8,
         'colsample_bytree': 0.8,
-        'min_child_weight': 3,   # 增加最小权重
-        'gamma': 0.2,            # 增加最小损失减少量
+        'min_child_weight': 3,
+        'gamma': 0.2,
     }
     return params
 
 
 def train_xgb_model_cv(X_train, y_train, X_val, y_val, sample_weights_train=None, sample_weights_val=None):
     """训练XGBoost模型（交叉验证用）"""
-    # 转换为 DMatrix 格式
     if sample_weights_train is not None and sample_weights_val is not None:
         dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weights_train)
         dval = xgb.DMatrix(X_val, label=y_val, weight=sample_weights_val)
@@ -151,18 +154,16 @@ def train_xgb_model_cv(X_train, y_train, X_val, y_val, sample_weights_train=None
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dval = xgb.DMatrix(X_val, label=y_val)
 
-    # 获取参数
     params = create_xgb_model_params()
-    params['num_class'] = len(np.unique(y_train))  # 动态设置类别数
+    params['num_class'] = len(np.unique(y_train))
 
-    # 使用原生训练 API + 早停
     evals_result = {}
     bst = xgb.train(
         params,
         dtrain,
-        num_boost_round=500,     # 减少迭代次数
+        num_boost_round=500,
         evals=[(dtrain, 'train'), (dval, 'val')],
-        early_stopping_rounds=30, # 早停轮数
+        early_stopping_rounds=30,
         evals_result=evals_result,
         verbose_eval=False
     )
@@ -176,6 +177,7 @@ def predict_xgb_model(model, X_test):
     class_probs = model.predict(dtest)
     y_pred = np.argmax(class_probs, axis=1)
     return y_pred, class_probs
+
 
 # ==============================================================================
 # 1. 主程序
@@ -197,13 +199,13 @@ if __name__ == "__main__":
     groups = df_features['filename']
     le = LabelEncoder()
     y = le.fit_transform(y_str)
-    # --- 【核心修正】定义全局常量 ---
     NUM_CLASSES = len(le.classes_)
+    input_dim = X_raw.shape[1]  # 获取特征维度
 
     print(f"\n🚀 步骤 2: 开始 {N_SPLITS} 折分组分层交叉验证...")
     sgkf = StratifiedGroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
 
-    all_y_test, xgb_all_y_pred, rf_all_y_pred, cnn_lstm_all_y_pred = [], [], [], []
+    all_y_test, xgb_all_y_pred, rf_all_y_pred, mlp_da_all_y_pred = [], [], [], []
 
     for fold, (train_idx, test_idx) in enumerate(sgkf.split(X_raw, y, groups)):
         print(f"\n--- 第 {fold + 1}/{N_SPLITS} 折 ---")
@@ -216,18 +218,16 @@ if __name__ == "__main__":
         all_y_test.extend(y_test)
 
         # ======================================================================
-        # XGBoost模型保持不变（你要求的）
+        # XGBoost模型保持不变
         # ======================================================================
         print("  - 正在训练 XGBoost (含早停调参)...")
         X_train_sub, X_val, y_train_sub, y_val = train_test_split(
             X_train, y_train, test_size=0.2, stratify=y_train, random_state=RANDOM_STATE
         )
 
-        # 计算样本权重
         sample_weights_train = compute_balanced_sample_weights(y_train_sub)
         sample_weights_val = compute_balanced_sample_weights(y_val)
 
-        # 使用封装的函数训练XGBoost模型
         bst = train_xgb_model_cv(
             X_train_sub, y_train_sub, X_val, y_val,
             sample_weights_train, sample_weights_val
@@ -235,12 +235,11 @@ if __name__ == "__main__":
 
         print(f"    最佳树数量: {bst.best_iteration}")
 
-        # 使用封装的函数进行预测
         y_pred_xgb, class_probs = predict_xgb_model(bst, X_test)
         xgb_all_y_pred.extend(y_pred_xgb)
 
         # ======================================================================
-        # 新增：随机森林模型
+        # 随机森林模型保持不变
         # ======================================================================
         print("  - 正在训练随机森林...")
         rf_model = RandomForestClassifier(
@@ -256,46 +255,50 @@ if __name__ == "__main__":
         rf_all_y_pred.extend(y_pred_rf)
 
         # ======================================================================
-        # 新增：CNN+LSTM模型
+        # 修改：简化 MLP + DA 模型 (替代 CNN-LSTM)
         # ======================================================================
-        print("  - 正在训练 CNN+LSTM (含早停)...")
-        X_train_cnn, X_test_cnn = np.expand_dims(X_train, axis=2), np.expand_dims(X_test, axis=2)
+        print("  - 正在训练 简化 MLP + DA 模型 (含早停)...")
         y_train_cat = to_categorical(y_train, num_classes=NUM_CLASSES)
-        cnn_lstm_model = create_cnn_lstm_model(input_shape=(X_train_cnn.shape[1], 1), num_classes=NUM_CLASSES)
-        early_stopping = EarlyStopping(monitor='val_accuracy', patience=20, restore_best_weights=True)
+        # 注意：这里不再需要 expand_dims，直接使用 (batch_size, features)
+        # 创建模型
+        mlp_da_model = create_mlp_da_model(input_dim=input_dim, num_classes=NUM_CLASSES, lambda_grl=1.0)
+        early_stopping = EarlyStopping(monitor='val_class_output_accuracy', mode='max', patience=20,
+                                       restore_best_weights=True)
 
-        # 计算类别权重（添加这部分）
-        class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-        class_weight_dict = dict(enumerate(class_weights))
+        # 准备伪领域标签 (在源域训练中，所有样本都标记为源域 0)
+        domain_labels_source_train = np.zeros((X_train.shape[0], 1))
+        domain_labels_source_val = np.zeros((X_train_sub.shape[0], 1))  # 用于验证集
 
-        # 特别加强B类和N类的权重
-        # 假设B类索引为0，N类索引为2（需要根据实际情况调整）
-        b_class_index = 0  # 根据你的标签编码调整
-        n_class_index = 2  # 根据你的标签编码调整
-
-        if b_class_index in class_weight_dict:
-            class_weight_dict[b_class_index] = class_weight_dict[b_class_index] * 2.0  # B类权重加倍
-        if n_class_index in class_weight_dict:
-            class_weight_dict[n_class_index] = class_weight_dict[n_class_index] * 1.5  # N类权重增加50%
-
-        cnn_lstm_model.fit(
-            X_train_cnn, y_train_cat,
-            epochs=100,  # 减少训练轮数
-            batch_size=64,  # 增大批次大小节省显存
+        # 训练模型 (简化处理，实际应用中可使用自定义循环进行更精确的DA)
+        # 这里我们简化处理，只在训练集上训练主任务和领域任务
+        # 验证集也标记为源域
+        X_train_sub_scaled = scaler.transform(X_train_sub)  # 验证集也需要标准化
+        history = mlp_da_model.fit(
+            X_train,
+            {"class_output": y_train_cat, "domain_output": domain_labels_source_train},
+            epochs=100,
+            batch_size=64,
             verbose=0,
-            validation_split=0.2,
-            class_weight=class_weight_dict,  # 添加类别权重
+            validation_data=(
+                X_train_sub_scaled,
+                {"class_output": to_categorical(y_train_sub, num_classes=NUM_CLASSES),
+                 "domain_output": domain_labels_source_val}
+            ),
             callbacks=[early_stopping]
         )
-        y_pred_cnn_lstm_prob = cnn_lstm_model.predict(X_test_cnn)
-        y_pred_cnn_lstm = np.argmax(y_pred_cnn_lstm_prob, axis=1)
-        cnn_lstm_all_y_pred.extend(y_pred_cnn_lstm)
+        print(f"    训练完成，最佳Epoch: {len(history.history['loss']) - early_stopping.patience}")
+
+        # 预测 (只使用分类输出)
+        y_pred_mlp_da_prob, _ = mlp_da_model.predict(X_test)
+        y_pred_mlp_da = np.argmax(y_pred_mlp_da_prob, axis=1)
+        mlp_da_all_y_pred.extend(y_pred_mlp_da)
 
     print("\n🚀 步骤 3: 交叉验证完成，汇总评估结果...")
+    # 更新模型结果字典
     models_results = {
         "XGBoost": xgb_all_y_pred,
         "RandomForest": rf_all_y_pred,
-        "CNN-LSTM": cnn_lstm_all_y_pred
+        "MLP-DA": mlp_da_all_y_pred  # 更新键名
     }
 
     for model_name, y_pred in models_results.items():
@@ -335,16 +338,15 @@ if __name__ == "__main__":
     # XGBoost最终模型保持不变
     # ======================================================================
     print("  - 正在训练最终的XGBoost模型...")
-    # 计算样本权重，重点提升N类权重
     sample_weights_full = compute_balanced_sample_weights(y)
 
     final_xgb_model = xgb.XGBClassifier(
         objective='multi:softprob',
         eval_metric='mlogloss',
         random_state=RANDOM_STATE,
-        n_estimators=500,  # 增加树数量
-        max_depth=6,  # 降低深度避免过拟合
-        learning_rate=0.1,  # 合适的学习率
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.1,
         subsample=0.8,
         colsample_bytree=0.8,
         min_child_weight=3,
@@ -353,7 +355,7 @@ if __name__ == "__main__":
     final_xgb_model.fit(X_scaled_full, y, sample_weight=sample_weights_full)
 
     # ======================================================================
-    # 新增：随机森林最终模型
+    # 随机森林最终模型保持不变
     # ======================================================================
     print("  - 正在训练最终的随机森林模型...")
     final_rf_model = RandomForestClassifier(
@@ -367,41 +369,39 @@ if __name__ == "__main__":
     final_rf_model.fit(X_scaled_full, y)
 
     # ======================================================================
-    # 新增：CNN+LSTM最终模型
+    # 修改：训练最终的 MLP + DA 模型 (替代 CNN-LSTM)
     # ======================================================================
-    print("  - 正在训练最终的CNN+LSTM模型...")
-    X_cnn_full = np.expand_dims(X_scaled_full, axis=2)
+    print("  - 正在训练最终的 MLP + DA 模型...")
     y_cat_full = to_categorical(y, num_classes=NUM_CLASSES)
-    final_cnn_lstm_model = create_cnn_lstm_model(input_shape=(X_cnn_full.shape[1], 1), num_classes=NUM_CLASSES)
-    # --- 【核心修正】为最终模型训练添加早停，防止过拟合 ---
-    early_stopping_final = EarlyStopping(monitor='accuracy', patience=20, restore_best_weights=True)
+    # 创建最终模型
+    final_mlp_da_model = create_mlp_da_model(input_dim=input_dim, num_classes=NUM_CLASSES, lambda_grl=1.0)
+    early_stopping_final = EarlyStopping(monitor='class_output_accuracy', mode='max', patience=20,
+                                         restore_best_weights=True)
 
-    # 为最终模型也添加类别权重（添加这部分）
-    class_weights_final = compute_class_weight('balanced', classes=np.unique(y), y=y)
-    class_weight_dict_final = dict(enumerate(class_weights_final))
+    # 准备伪领域标签
+    domain_labels_full = np.zeros((X_scaled_full.shape[0], 1))
 
-    # 特别加强B类和N类的权重
-    b_class_index = 0  # 根据你的标签编码调整
-    n_class_index = 2  # 根据你的标签编码调整
-
-    if b_class_index in class_weight_dict_final:
-        class_weight_dict_final[b_class_index] = class_weight_dict_final[b_class_index] * 3.0
-    if n_class_index in class_weight_dict_final:
-        class_weight_dict_final[n_class_index] = class_weight_dict_final[n_class_index] * 1.5
-
-    final_cnn_lstm_model.fit(X_cnn_full, y_cat_full, epochs=100, batch_size=64, verbose=0,
-                             class_weight=class_weight_dict_final,  # 添加类别权重
-                             callbacks=[early_stopping_final])
+    # 训练最终模型
+    final_mlp_da_model.fit(
+        X_scaled_full,
+        {"class_output": y_cat_full, "domain_output": domain_labels_full},
+        epochs=100,
+        batch_size=64,
+        verbose=0,
+        callbacks=[early_stopping_final]
+    )
 
     print("\n🚀 步骤 5: 正在保存最终产出...")
     joblib.dump(final_xgb_model, os.path.join(OUTPUT_DIR, 'final_xgb_model.joblib'))
-    joblib.dump(final_rf_model, os.path.join(OUTPUT_DIR, 'final_rf_model.joblib'))  # 新增
+    joblib.dump(final_rf_model, os.path.join(OUTPUT_DIR, 'final_rf_model.joblib'))
     joblib.dump(final_scaler, os.path.join(OUTPUT_DIR, 'final_scaler.joblib'))
     joblib.dump(le, os.path.join(OUTPUT_DIR, 'final_label_encoder.joblib'))
-    # --- 【核心修正】将 .keras 改为 .h5 以确保兼容性 ---
-    # 修改文件扩展名为 .weights.h5
-    final_cnn_lstm_model.save_weights(os.path.join(OUTPUT_DIR, 'final_cnn_lstm_model.weights.h5'))
-    print("✅ CNN-LSTM 模型权重已保存。")
+
+    # --- 修改：保存 MLP + DA 模型的权重 ---
+    # 保存权重，使用 .weights.h5 扩展名
+    final_mlp_da_model.save_weights(os.path.join(OUTPUT_DIR, 'final_mlp_da_model.weights.h5'))
+    print("✅ MLP-DA 模型权重已保存。")
+    # --- 修改结束 ---
 
     print(f"✅ 最终模型及预处理器已保存至: {os.path.abspath(OUTPUT_DIR)}")
     print("\n🎉 任务二：源域故障诊断（最终版）全部工作已圆满完成！")

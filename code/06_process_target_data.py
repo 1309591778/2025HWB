@@ -216,8 +216,8 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
                     'N_impulse_indicator': 0
                 }
 
-            # 整合所有特征
-            features = {
+            # 整合所有特征 (原有代码)
+            features_full = {
                 'source_file': filename, 'rpm': target_rpm,
                 # 原有特征
                 'rms': rms, 'kurtosis': kurt, 'skewness': sk,
@@ -236,8 +236,26 @@ def process_target_data(target_dir, segment_len=4096, stride=512):
                 **n_class_specific_features,
             }
             for j, energy in enumerate(wavelet_energy):
-                features[f'wavelet_energy_{j}'] = energy
-            all_features_list.append(features)
+                features_full[f'wavelet_energy_{j}'] = energy
+
+            # --- 【新增】只保留任务一选定的特征 ---
+            # 确保 selected_feature_names 在函数作用域内可用，或者作为参数传入
+            # 这里假设 selected_feature_names 是全局加载的，或者通过其他方式传递
+            # 为简化，我们在这里直接筛选，但更健壮的做法是在函数参数中传递 selected_feature_names
+            # 或者在函数内部重新加载（不推荐，效率低）
+            # 临时解决方案：假设 selected_feature_names 已在主程序开始时加载为全局变量
+            global selected_feature_names  # 声明使用全局变量
+            features_selected = {'source_file': filename, 'rpm': target_rpm}  # 保留必要信息
+            for fname in selected_feature_names:
+                if fname in features_full:
+                    features_selected[fname] = features_full[fname]
+                else:
+                    print(f"  - 警告：在目标域特征中未找到任务一选定的特征 '{fname}'，将填充为0。")
+                    features_selected[fname] = 0  # 或者 np.nan, 根据模型容忍度决定
+            # --- 【新增结束】 ---
+
+            # all_features_list.append(features) # 注释掉旧的添加方式
+            all_features_list.append(features_selected)  # 添加筛选后的特征
 
         print(f"  - ✅ 已处理: {filename} -> 生成了 {num_segments} 个样本段。")
 
@@ -252,6 +270,22 @@ if __name__ == "__main__":
     TARGET_DATA_DIR = os.path.join('..', 'data', 'target')
     PROCESSED_DIR = os.path.join('..', 'data', 'processed')
     TARGET_FEATURES_PATH = os.path.join(PROCESSED_DIR, 'target_features.csv')
+
+    # --- 【新增】加载任务一筛选出的特征名称 ---
+    SELECTED_FEATURES_PATH = os.path.join('..', 'data', 'processed', 'selected_feature_names.txt')
+    try:
+        with open(SELECTED_FEATURES_PATH, 'r') as f:
+            # 读取特征名并去除换行符
+            selected_feature_names = [line.strip() for line in f.readlines()]
+        print(f"✅ 成功加载任务一筛选出的特征列表，共 {len(selected_feature_names)} 个特征。")
+        # print(f"特征列表: {selected_feature_names}") # 可选：打印确认
+    except FileNotFoundError:
+        print(f"‼️ 错误：找不到任务一的特征列表文件 {SELECTED_FEATURES_PATH}。请先运行任务一的特征筛选脚本。")
+        exit(1)
+    except Exception as e:
+        print(f"‼️ 加载特征列表时发生错误: {e}")
+        exit(1)
+    # --- 【新增结束】 ---
 
     df_target_features = process_target_data(TARGET_DATA_DIR)
 
