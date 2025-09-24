@@ -210,18 +210,22 @@ if __name__ == "__main__":
     print(f"  - ✅ 决策完成：筛选出 {len(final_features_to_keep)} 个特征用于后续建模。")
     # print(f"  - 筛选出的特征列表: {final_features_to_keep}")
 
-    # 保存最终筛选的特征集
-    final_columns = ['filename', 'label', 'rpm'] + final_features_to_keep
+    # --- 【修改】保存最终筛选的特征集，保证特征列顺序 ---
+    # 1. 确定最终列顺序：['filename', 'label', 'rpm'] + 筛选出的特征（按重要性排序顺序）
+    final_columns = ['filename', 'label', 'rpm'] + final_features_to_keep # 保持重要性排序顺序
+    # 2. 从 df_features 中选择这些列，并按指定顺序排列
     df_final_source = df_features[final_columns]
 
     save_path_source = os.path.join(PROCESSED_DIR, 'source_features_selected.csv')
     df_final_source.to_csv(save_path_source, index=False)
     print(f"  - ✅ 筛选后的源域特征集已保存至: {os.path.abspath(save_path_source)}")
 
-    # 保存筛选出的特征名称列表，供06脚本使用
+    # --- 【修改】保存筛选出的特征名称列表，顺序与源域特征集一致 ---
+    # 保存的特征名称顺序应与 df_final_source 中的特征列顺序一致
+    # 即，与 final_features_to_keep 的顺序一致
     save_path_feature_list = os.path.join(PROCESSED_DIR, 'selected_feature_names.txt')
     with open(save_path_feature_list, 'w') as f:
-        for feature_name in final_features_to_keep:
+        for feature_name in final_features_to_keep: # 使用与 df_final_source 相同的顺序
             f.write(f"{feature_name}\n")
     print(f"  - ✅ 筛选出的特征名称列表已保存至: {os.path.abspath(save_path_feature_list)}")
 

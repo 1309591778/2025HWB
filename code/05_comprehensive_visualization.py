@@ -94,7 +94,7 @@ def visualize_wpt_energy_packets(segment, sample_rate, class_title, class_code, 
 
 
 # ==============================================================================
-# 1. 新增：小波时频图（CWT）可视化函数
+# 1. 新增：小波时频图（CWT）可视化函数 —— 【已修正】
 # ==============================================================================
 def visualize_cwt_time_frequency(segment, sample_rate, class_title, class_code, plot_color, output_dir):
     """
@@ -108,45 +108,62 @@ def visualize_cwt_time_frequency(segment, sample_rate, class_title, class_code, 
     # 定义小波尺度（对应频率分辨率）
     widths = np.arange(1, 128)  # 小波尺度范围
 
-    # 执行连续小波变换 (CWT) - 使用 morlet 小波
+    # 执行连续小波变换 (CWT) - 使用 ricker 小波
     coefficients = scipy.signal.cwt(segment, scipy.signal.ricker, widths)
 
     # 构造频率轴（近似转换）
-    # 注意：对于 Ricker 小波，频率和尺度的关系不是线性的，这里做简化处理
-    freq_axis = np.linspace(1, 500, len(widths))  # 假设最大频率为 500 Hz
+    freq_axis = np.linspace(1, 500, len(widths))
+
+    # ✅【关键修改1】只保留 0~500 Hz 频段
+    mask = freq_axis <= 500
+    coefficients = coefficients[mask, :]
+    freq_axis = freq_axis[mask]
+
+    # ✅【关键修改2】计算幅值并归一化 + 对数压缩
+    magnitude = np.abs(coefficients)
+    magnitude_norm = magnitude / np.max(magnitude)  # 归一化到 [0,1]
+    magnitude_log = np.log(magnitude_norm + 1e-10)  # 对数压缩
+    magnitude_log_norm = (magnitude_log - np.min(magnitude_log)) / (np.max(magnitude_log) - np.min(magnitude_log))
 
     # 绘图
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    # 绘制时频图（使用热力图）
-    im = ax.contourf(time_axis, freq_axis, np.abs(coefficients), levels=50, cmap='viridis', extend='both')
-    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('幅值', rotation=270, labelpad=20, fontsize=12)
+    # ✅【关键修改3】绘制归一化对数幅值，使用 'viridis_r' 色图（紫→蓝→绿→黄）
+    im = ax.contourf(time_axis, freq_axis, magnitude_log_norm, levels=50, cmap='viridis_r', extend='both')
 
-    # 设置标题和标签
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('归一化 log(|CWT|)', rotation=270, labelpad=20, fontsize=12)
+
     ax.set_title(f'{class_title} ({class_code}) - 小波时频图', fontsize=16, weight='bold')
     ax.set_xlabel('时间 (s)', fontsize=12)
     ax.set_ylabel('频率 (Hz)', fontsize=12)
+    ax.set_ylim([0, 500])  # 强制 y 轴范围，确保 BPFI 线可见
     ax.grid(True, linestyle='--', alpha=0.5)
 
     # 添加理论故障频率线
-    idx = np.where(labels == class_code)[0][0]  # 假设labels是全局变量，这里需要调整
+    idx = np.where(labels == class_code)[0][0]  # 假设 labels 是全局变量
     rpm = rpms[idx]
     theo_freqs = calculate_theoretical_frequencies(rpm)
     bpfi = theo_freqs['BPFI']
     bpfo = theo_freqs['BPFO']
 
-    # 标注 BPFI 和 2×BPFI
-    ax.axhline(y=bpfi, color='red', linestyle='--', linewidth=1.5, alpha=0.8)
-    ax.axhline(y=2*bpfi, color='red', linestyle=':', linewidth=1.5, alpha=0.8)
-    legend_text = [
-        f'--- BPFI={bpfi:.1f}Hz',
-        f'.... 2×BPFI={2*bpfi:.1f}Hz'
-    ]
-    ax.legend(handles=[
-        plt.Line2D([0], [0], color='red', linestyle='--', lw=1.5),
-        plt.Line2D([0], [0], color='red', linestyle=':', lw=1.5)
-    ], labels=legend_text, loc='upper right')
+    # 标注 BPFI 和 2×BPFI（确保在绘图范围内）
+    if bpfi <= 500:
+        ax.axhline(y=bpfi, color='red', linestyle='--', linewidth=1.5, alpha=0.8)
+    if 2*bpfi <= 500:
+        ax.axhline(y=2*bpfi, color='red', linestyle=':', linewidth=1.5, alpha=0.8)
+
+    legend_text = []
+    handles = []
+    if bpfi <= 500:
+        legend_text.append(f'--- BPFI={bpfi:.1f}Hz')
+        handles.append(plt.Line2D([0], [0], color='red', linestyle='--', lw=1.5))
+    if 2*bpfi <= 500:
+        legend_text.append(f'.... 2×BPFI={2*bpfi:.1f}Hz')
+        handles.append(plt.Line2D([0], [0], color='red', linestyle=':', lw=1.5))
+
+    if handles:
+        ax.legend(handles=handles, labels=legend_text, loc='upper right')
 
     plt.tight_layout()
     save_path_cwt = os.path.join(output_dir, f'图6-小波时频图_{class_code}.png')
