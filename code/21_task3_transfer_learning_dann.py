@@ -97,10 +97,47 @@ def create_improved_dann_model(input_dim, num_classes, lambda_grl=0.01, dropout_
 
 
 # --- 新增：自定义训练循环 (修正版) ---
-def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s_val_cat,
-                        epochs, batch_size, lambda_domain=0.001):
+# --- 新增：绘制训练过程曲线 ---
+def plot_training_curves(history, output_dir, seed):
     """
-    改进的DANN训练函数，使用更稳定的训练策略
+    绘制分类损失、域损失、验证准确率曲线
+    """
+    epochs = range(1, len(history['cls_loss']) + 1)
+    plt.figure(figsize=(12, 4))
+
+    # 子图1: 损失曲线
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history['cls_loss'], 'b-', label='Cls Loss')
+    plt.plot(epochs, history['dom_loss'], 'r--', label='Dom Loss')
+    plt.title('训练损失曲线')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 子图2: 验证准确率
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history['val_acc'], 'g-', label='Val Accuracy')
+    plt.title('源域验证准确率')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.ylim(0, 1)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, f'training_curves_seed_{seed}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ 训练过程曲线已保存至: {save_path}")
+# --- 新增结束 ---
+
+
+# --- 修改后的 train_improved_dann 函数 ---
+def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s_val_cat,
+                        epochs, batch_size, lambda_domain, output_dir, seed):
+    """
+    改进的DANN训练函数，使用更稳定的训练策略，并记录训练历史用于可视化
     """
     print("  - 开始改进的对抗训练...")
 
@@ -115,7 +152,7 @@ def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s
     steps_per_epoch = min(len(X_s_train) // batch_size, len(X_t_train) // batch_size)
     ds_combined = tf.data.Dataset.zip((ds_source_train, ds_target_train))
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)  # 降低学习率
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
     classification_loss_fn = tf.keras.losses.CategoricalCrossentropy()
     domain_loss_fn = tf.keras.losses.BinaryCrossentropy()
 
@@ -123,6 +160,13 @@ def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s
     train_class_acc = tf.keras.metrics.CategoricalAccuracy(name='train_class_accuracy')
     train_domain_acc = tf.keras.metrics.BinaryAccuracy(name='train_domain_accuracy')
     val_class_acc = tf.keras.metrics.CategoricalAccuracy(name='val_class_accuracy')
+
+    # 添加历史记录
+    history = {
+        'cls_loss': [],
+        'dom_loss': [],
+        'val_acc': []
+    }
 
     # 添加早停机制
     best_val_acc = 0.0
@@ -132,7 +176,6 @@ def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
 
-        # 重置metrics
         train_class_acc.reset_state()
         train_domain_acc.reset_state()
 
@@ -141,31 +184,24 @@ def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s
         num_batches = 0
 
         for step, ((x_s, y_s), x_t) in enumerate(ds_combined.take(steps_per_epoch)):
-            # 为目标域创建标签
-            domain_labels_s = tf.zeros((tf.shape(x_s)[0], 1))  # 源域为0
-            domain_labels_t = tf.ones((tf.shape(x_t)[0], 1))  # 目标域为1
+            domain_labels_s = tf.zeros((tf.shape(x_s)[0], 1))
+            domain_labels_t = tf.ones((tf.shape(x_t)[0], 1))
 
             with tf.GradientTape() as tape:
-                # 源域前向传播
                 y_pred_s, d_pred_s = model(x_s, training=True)
                 class_loss_s = classification_loss_fn(y_s, y_pred_s)
                 domain_loss_s = domain_loss_fn(domain_labels_s, d_pred_s)
 
-                # 目标域前向传播
                 _, d_pred_t = model(x_t, training=True)
                 domain_loss_t = domain_loss_fn(domain_labels_t, d_pred_t)
 
-                # 总损失 - 关键修改：大幅增加分类损失权重，降低域对抗权重
                 total_class_loss = class_loss_s
                 total_domain_loss = domain_loss_s + domain_loss_t
-                # 重要：确保分类任务不被域对抗任务压制
                 total_loss = 5.0 * total_class_loss + lambda_domain * total_domain_loss
 
-            # 更新参数
             grads = tape.gradient(total_loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
-            # 更新metrics
             train_class_acc.update_state(y_s, y_pred_s)
             combined_d_pred = tf.concat([d_pred_s, d_pred_t], axis=0)
             combined_d_labels = tf.concat([domain_labels_s, domain_labels_t], axis=0)
@@ -177,18 +213,22 @@ def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s
 
         # 验证
         val_class_acc.reset_state()
-        val_pred = model(X_s_val, training=False)[0]  # 只取分类输出
+        val_pred = model(X_s_val, training=False)[0]
         val_class_acc.update_state(y_s_val_cat, val_pred)
 
         avg_cls_loss = total_cls_loss / num_batches if num_batches > 0 else 0
         avg_dom_loss = total_dom_loss / num_batches if num_batches > 0 else 0
-
         current_val_acc = val_class_acc.result()
+
+        # 记录历史
+        history['cls_loss'].append(float(avg_cls_loss))
+        history['dom_loss'].append(float(avg_dom_loss))
+        history['val_acc'].append(float(current_val_acc))
+
         print(f" - Cls Loss: {avg_cls_loss:.4f}, Dom Loss: {avg_dom_loss:.4f}, "
               f"Train Cls Acc: {train_class_acc.result():.4f}, Train Dom Acc: {train_domain_acc.result():.4f}, "
               f"Val Acc: {current_val_acc:.4f}")
 
-        # 早停机制
         if current_val_acc > best_val_acc:
             best_val_acc = current_val_acc
             patience_counter = 0
@@ -197,6 +237,10 @@ def train_improved_dann(model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s
             if patience_counter >= patience:
                 print(f"  - 早停触发：验证准确率连续{patience}轮未提升，停止训练")
                 break
+
+    # --- 新增：训练结束后绘制曲线 ---
+    plot_training_curves(history, output_dir, seed)
+    # --- 新增结束 ---
 
     print("✅ 改进的对抗训练完成。")
 
@@ -296,13 +340,15 @@ if __name__ == "__main__":
             print(f"    - 源域训练集: {X_s_train.shape}, 验证集: {X_s_val.shape}")
             print(f"    - 目标域训练集: {X_t_train.shape}")
 
-            # 训练模型
+            # 训练模型（注意：传入 output_dir 和 seed）
             print("  - 开始对抗训练 (领域自适应)...")
             epochs = 20
             batch_size = 64
             lambda_domain = 0.001  # 关键：极低的 domain loss 权重
-            train_improved_dann(dann_model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s_val_cat, epochs,
-                                batch_size, lambda_domain)
+            train_improved_dann(
+                dann_model, X_s_train, y_s_train_cat, X_t_train, X_s_val, y_s_val_cat,
+                epochs, batch_size, lambda_domain, output_dir, seed  # <-- 新增参数
+            )
             print("✅ 对抗训练完成。")
 
             # 保存训练好的模型
