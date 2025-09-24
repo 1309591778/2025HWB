@@ -27,7 +27,7 @@ def load_mat_file(file_path: str):
 # ==============================================================================
 # 2. 数据加载、预处理与分段核心函数 (核心修改)
 # ==============================================================================
-def load_preprocess_and_segment(df_selected_files, target_sr=32000, segment_len=4096, stride=512):
+def load_preprocess_and_segment(df_selected_files, target_sr=32000, segment_len=3200, stride=400):
     """
     【最终版】对筛选出的文件进行加载、重采样和重叠分段，并记录每个分段的来源文件名。
     """
@@ -102,8 +102,8 @@ if __name__ == "__main__":
         segments, labels, rpms, filenames = load_preprocess_and_segment(
             df_selected_files=df_selected,
             target_sr=32000,
-            segment_len=4096,
-            stride=512
+            segment_len=3200,
+            stride=400
         )
 
         print(f"\n📊 预处理结果统计:")

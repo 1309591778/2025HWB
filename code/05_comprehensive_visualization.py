@@ -1,3 +1,4 @@
+# 10_task1_final_visualizations.py
 import os
 import numpy as np
 import pandas as pd
@@ -7,6 +8,12 @@ from matplotlib import font_manager
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
+import scipy.io
+import scipy.signal
+import pywt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
 
 
 # ==============================================================================
@@ -35,7 +42,121 @@ def calculate_theoretical_frequencies(rpm):
 
 
 # ==============================================================================
-# 1. 可视化函数
+# 1. 新增：时频域分析可视化函数 (小波包变换 WPT)
+# ==============================================================================
+def visualize_wpt_energy_packets(segment, sample_rate, class_title, class_code, plot_color, output_dir):
+    """
+    对单个信号段进行小波包变换(WPT)并可视化其能量分布。
+    """
+    print(f"  - 正在为 {class_title} ({class_code}) 生成小波包能量图...")
+
+    # 1. 执行小波包变换 (3层分解)
+    wp = pywt.WaveletPacket(data=segment, wavelet='db1', mode='symmetric', maxlevel=3)
+
+    # 2. 获取第3层的所有节点
+    nodes = wp.get_level(3, order='natural')
+
+    # 3. 计算每个节点的能量 (节点数据的平方和)
+    packet_energies = np.array([np.sum(node.data ** 2) for node in nodes])
+
+    # 4. 创建时间轴 (与原始信号长度一致)
+    time_axis = np.arange(len(segment)) / sample_rate
+
+    # 5. 绘图
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # --- 绘制原始信号 ---
+    ax.plot(time_axis, segment, color=plot_color, alpha=0.7, linewidth=0.8, label='原始信号')
+
+    # --- 绘制能量包络 ---
+    num_packets = len(packet_energies)
+    if num_packets > 0:
+        segment_length_per_packet = len(segment) // num_packets
+        energy_envelope = np.repeat(packet_energies, segment_length_per_packet)
+        if len(energy_envelope) < len(segment):
+            energy_envelope = np.pad(energy_envelope, (0, len(segment) - len(energy_envelope)), constant_values=0)
+        elif len(energy_envelope) > len(segment):
+            energy_envelope = energy_envelope[:len(segment)]
+
+        ax.fill_between(time_axis, 0, -energy_envelope / np.max(energy_envelope) * np.max(np.abs(segment)) * 0.3,
+                         color=plot_color, alpha=0.4, label='WPT能量包络 (示意)')
+
+    ax.set_title(f'{class_title} ({class_code}) - 小波包变换 (WPT) 能量分布', fontsize=16, weight='bold')
+    ax.set_xlabel('时间 (s)', fontsize=12)
+    ax.set_ylabel('加速度 / 能量 (示意)', fontsize=12)
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    save_path_wpt = os.path.join(output_dir, f'图5-WPT能量分布_{class_code}.png')
+    plt.savefig(save_path_wpt, dpi=300)
+    plt.close(fig)
+    print(f"  - ✅ {class_title} ({class_code}) 的 WPT 能量图已保存至: {save_path_wpt}")
+
+
+# ==============================================================================
+# 1. 新增：小波时频图（CWT）可视化函数
+# ==============================================================================
+def visualize_cwt_time_frequency(segment, sample_rate, class_title, class_code, plot_color, output_dir):
+    """
+    使用连续小波变换（CWT）生成时频图，并标注理论故障频率。
+    """
+    print(f"  - 正在为 {class_title} ({class_code}) 生成小波时频图...")
+
+    # 时间轴
+    time_axis = np.arange(len(segment)) / sample_rate
+
+    # 定义小波尺度（对应频率分辨率）
+    widths = np.arange(1, 128)  # 小波尺度范围
+
+    # 执行连续小波变换 (CWT) - 使用 morlet 小波
+    coefficients = scipy.signal.cwt(segment, scipy.signal.ricker, widths)
+
+    # 构造频率轴（近似转换）
+    # 注意：对于 Ricker 小波，频率和尺度的关系不是线性的，这里做简化处理
+    freq_axis = np.linspace(1, 500, len(widths))  # 假设最大频率为 500 Hz
+
+    # 绘图
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # 绘制时频图（使用热力图）
+    im = ax.contourf(time_axis, freq_axis, np.abs(coefficients), levels=50, cmap='viridis', extend='both')
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('幅值', rotation=270, labelpad=20, fontsize=12)
+
+    # 设置标题和标签
+    ax.set_title(f'{class_title} ({class_code}) - 小波时频图', fontsize=16, weight='bold')
+    ax.set_xlabel('时间 (s)', fontsize=12)
+    ax.set_ylabel('频率 (Hz)', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    # 添加理论故障频率线
+    idx = np.where(labels == class_code)[0][0]  # 假设labels是全局变量，这里需要调整
+    rpm = rpms[idx]
+    theo_freqs = calculate_theoretical_frequencies(rpm)
+    bpfi = theo_freqs['BPFI']
+    bpfo = theo_freqs['BPFO']
+
+    # 标注 BPFI 和 2×BPFI
+    ax.axhline(y=bpfi, color='red', linestyle='--', linewidth=1.5, alpha=0.8)
+    ax.axhline(y=2*bpfi, color='red', linestyle=':', linewidth=1.5, alpha=0.8)
+    legend_text = [
+        f'--- BPFI={bpfi:.1f}Hz',
+        f'.... 2×BPFI={2*bpfi:.1f}Hz'
+    ]
+    ax.legend(handles=[
+        plt.Line2D([0], [0], color='red', linestyle='--', lw=1.5),
+        plt.Line2D([0], [0], color='red', linestyle=':', lw=1.5)
+    ], labels=legend_text, loc='upper right')
+
+    plt.tight_layout()
+    save_path_cwt = os.path.join(output_dir, f'图6-小波时频图_{class_code}.png')
+    plt.savefig(save_path_cwt, dpi=300)
+    plt.close(fig)
+    print(f"  - ✅ {class_title} ({class_code}) 的小波时频图已保存至: {save_path_cwt}")
+
+
+# ==============================================================================
+# 1. 可视化函数 (原有代码保持不变)
 # ==============================================================================
 def create_final_visualizations(segments, labels, rpms, df_features, sample_rate=32000):
     """生成任务一的四张核心分析图表"""
@@ -52,7 +173,6 @@ def create_final_visualizations(segments, labels, rpms, df_features, sample_rate
     fig1, axes1 = plt.subplots(2, 2, figsize=(18, 10), sharey=True)
     fig1.suptitle('四种轴承状态时域波形对比图', fontsize=22, weight='bold')
     for ax, class_code in zip(axes1.flatten(), ['N', 'B', 'IR', 'OR']):
-        # ... (代码与之前版本相同)
         idx = class_representatives[class_code]
         segment = segments[idx]
         time_axis = np.arange(len(segment)) / sample_rate
@@ -72,8 +192,8 @@ def create_final_visualizations(segments, labels, rpms, df_features, sample_rate
     fig2.suptitle('四种轴承状态频域频谱对比图', fontsize=22, weight='bold')
     freq_colors = {'BPFO': 'red', 'BPFI': 'green', 'BSF': 'blue'}
     for ax, class_code in zip(axes2.flatten(), ['N', 'B', 'IR', 'OR']):
-        # ... (代码与之前版本相同)
-        idx, rpm = class_representatives[class_code], rpms[class_representatives[class_code]]
+        idx = class_representatives[class_code]
+        rpm = rpms[idx]
         segment = segments[idx]
         n = len(segment)
         freq_axis = np.fft.fftfreq(n, 1 / sample_rate)[:n // 2]
@@ -132,27 +252,70 @@ def create_final_visualizations(segments, labels, rpms, df_features, sample_rate
     plt.close()
     print(f"  - ✅ 图三 (t-SNE图) 已保存。")
 
-    # --- 图四：特征重要性排序条形图 ---
+    # --- 图四：特征重要性排序条形图 (修改版 - 渐变色) ---
     print("  - 正在计算特征重要性...")
+    feature_columns = [col for col in df_features.columns if col not in ['label', 'rpm', 'filename']]
+    X_features_only = df_features[feature_columns]
+    y_str = df_features['label']
+
     le = LabelEncoder()
     y = le.fit_transform(y_str)
     model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
-    model.fit(X, y)  # 注意：此处使用未缩放的X，对于树模型影响不大
+    model.fit(X_features_only, y)
     importances = model.feature_importances_
-    df_importance = pd.DataFrame({'feature': X.columns, 'importance': importances}).sort_values(by='importance',
-                                                                                                ascending=False)
+    df_importance = pd.DataFrame({'feature': X_features_only.columns, 'importance': importances}).sort_values(
+        by='importance',
+        ascending=False)
 
     plt.figure(figsize=(12, 10))
-    sns.barplot(x='importance', y='feature', data=df_importance.head(20))
-    plt.title('Top 20 特征重要性排序 (随机森林)', fontsize=16)
-    plt.xlabel('重要性分数')
-    plt.ylabel('特征名称')
-    plt.grid(True)
+    top_features_df = df_importance.head(20)
+    features = top_features_df['feature']
+    importances_vals = top_features_df['importance']
+    y_positions = np.arange(len(features))
+
+    cmap = plt.cm.get_cmap('viridis')
+    norm = Normalize(vmin=importances_vals.min(), vmax=importances_vals.max())
+    colors = cmap(norm(importances_vals))
+
+    bars = plt.barh(y_positions, importances_vals, color=colors, height=0.7, edgecolor='grey', linewidth=0.5)
+    plt.yticks(y_positions, features, fontsize=10)
+    plt.xlabel('重要性分数', fontsize=12)
+    plt.ylabel('特征名称', fontsize=12)
+    plt.title('Top 20 特征重要性排序 (随机森林)', fontsize=16, weight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(axis='x', linestyle='--', alpha=0.6)
+
+    sm = ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=plt.gca(), shrink=0.8)
+    cbar.set_label('重要性分数', rotation=270, labelpad=20, fontsize=12)
+
     plt.tight_layout()
     save_path4 = os.path.join(output_dir, '图4-特征重要性排序.png')
     plt.savefig(save_path4, dpi=300)
     plt.close()
-    print(f"  - ✅ 图四 (特征重要性图) 已保存。")
+    print(f"  - ✅ 图四 (特征重要性图 - 渐变色) 已保存。")
+
+    # --- 【新增】图五：时频域分析 (小波包变换 WPT) ---
+    print("\n--- 新增：生成时频域分析 (小波包变换 WPT) 可视化 ---")
+    for class_code in ['N', 'B', 'IR', 'OR']:
+        idx = class_representatives[class_code]
+        segment = segments[idx]
+        visualize_wpt_energy_packets(
+            segment, sample_rate, class_titles[class_code], class_code, plot_colors[class_code], output_dir
+        )
+    print("✅ 时频域分析 (WPT) 可视化完成。")
+
+    # --- 【新增】图六：小波时频图 (CWT) ---
+    print("\n--- 新增：生成小波时频图 (CWT) 可视化 ---")
+    for class_code in ['N', 'B', 'IR', 'OR']:
+        idx = class_representatives[class_code]
+        segment = segments[idx]
+        visualize_cwt_time_frequency(
+            segment, sample_rate, class_titles[class_code], class_code, plot_colors[class_code], output_dir
+        )
+    print("✅ 小波时频图 (CWT) 可视化完成。")
+    # --- 【新增结束】 ---
 
 
 # ==============================================================================
@@ -166,7 +329,6 @@ if __name__ == "__main__":
         segments = np.load(os.path.join(PROCESSED_DIR, 'source_segments.npy'))
         labels = np.load(os.path.join(PROCESSED_DIR, 'source_labels.npy'))
         rpms = np.load(os.path.join(PROCESSED_DIR, 'source_rpms.npy'))
-        # 加载包含所有特征的文件，用于t-SNE和重要性分析
         df_features = pd.read_csv(os.path.join(PROCESSED_DIR, 'source_features.csv'))
 
         print(f"成功加载所有必需数据。")
